@@ -17,7 +17,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Float32, Boolean, const_expr
 
-from fast_reduction import dsl_utils
+from fast_reduction import cute_utils
 
 
 # ---- block reduction (SMEM) ----
@@ -77,9 +77,9 @@ def cluster_reduce(
                 num_warps * cluster_n * reduction_buffer.element_type.width // 8,
             )
     if lane_idx < cluster_n:
-        dsl_utils.store_shared_remote(
+        cute_utils.store_shared_remote(
             val,
-            dsl_utils.elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
+            cute_utils.elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
             mbar_ptr,
             peer_cta_rank_in_cluster=lane_idx,
         )
@@ -206,12 +206,12 @@ def online_softmax_reduce(
             if const_expr(mbar_ptr is None):
                 # Block reduction path
                 if lane_idx == 0:
-                    reduction_buffer[row_idx, col_idx] = dsl_utils.f32x2_to_i64(max_x, sum_exp_x)
+                    reduction_buffer[row_idx, col_idx] = cute_utils.f32x2_to_i64(max_x, sum_exp_x)
                 cute.arch.barrier()
                 max_x_single_warp = -Float32.inf
                 sum_exp_x = 0.0
                 if lane_idx < warps_per_row:
-                    max_x_single_warp, sum_exp_x = dsl_utils.i64_to_f32x2(
+                    max_x_single_warp, sum_exp_x = cute_utils.i64_to_f32x2(
                         reduction_buffer[row_idx, lane_idx]
                     )
                 max_x_final = cute.arch.warp_reduction(max_x_single_warp, cute.arch.fmax)
@@ -231,9 +231,9 @@ def online_softmax_reduce(
                             num_warps * cluster_n * reduction_buffer.element_type.width // 8,
                         )
                 if lane_idx < cluster_n:
-                    dsl_utils.store_shared_remote(
-                        dsl_utils.f32x2_to_i64(max_x, sum_exp_x),
-                        dsl_utils.elem_pointer(
+                    cute_utils.store_shared_remote(
+                        cute_utils.f32x2_to_i64(max_x, sum_exp_x),
+                        cute_utils.elem_pointer(
                             reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))
                         ),
                         mbar_ptr,
@@ -248,7 +248,7 @@ def online_softmax_reduce(
                 for i in cutlass.range_constexpr(num_iter):
                     idx = lane_idx + i * cute.arch.WARP_SIZE
                     if idx < cute.size(reduction_buffer, mode=[1]):
-                        max_x_single_warp[i], sum_exp_x_single_warp[i] = dsl_utils.i64_to_f32x2(
+                        max_x_single_warp[i], sum_exp_x_single_warp[i] = cute_utils.i64_to_f32x2(
                             reduction_buffer[row_idx, idx]
                         )
                 max_x_final = max_x_single_warp.load().reduce(

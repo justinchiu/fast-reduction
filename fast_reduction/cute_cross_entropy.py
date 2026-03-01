@@ -25,7 +25,7 @@ import cutlass.cute as cute
 from cutlass import Int32, Int64, Float32, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync
 
-from fast_reduction import dsl_utils
+from fast_reduction import cute_utils
 from fast_reduction.reduce import row_reduce, online_softmax_reduce
 
 
@@ -248,7 +248,7 @@ class CrossEntropyOnly(_KernelBase):
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         if const_expr(not is_even_N):
-            dsl_utils.fill_oob(tXsX, tXpX, -tXsX.element_type.inf)
+            cute_utils.fill_oob(tXsX, tXpX, -tXsX.element_type.inf)
         cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(Float32)
 
@@ -371,7 +371,7 @@ class EntropyOnly(_KernelBase):
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         if const_expr(not is_even_N):
-            dsl_utils.fill_oob(tXsX, tXpX, -tXsX.element_type.inf)
+            cute_utils.fill_oob(tXsX, tXpX, -tXsX.element_type.inf)
         cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(Float32)
 
@@ -505,7 +505,7 @@ class CrossEntropyEntropy(_KernelBase):
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         if const_expr(not is_even_N):
-            dsl_utils.fill_oob(tXsX, tXpX, -tXsX.element_type.inf)
+            cute_utils.fill_oob(tXsX, tXpX, -tXsX.element_type.inf)
         cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(Float32)
 

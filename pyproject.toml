@@ -5,6 +5,7 @@ requires-python = ">=3.10"
 dependencies = [
     "apache-tvm-ffi>=0.1.9",
     "nvidia-cutlass-dsl>=4.4.1",
+    "quack-kernels",
     "torch>=2.5",
 ]
 
@@ -19,6 +20,7 @@ dev = [
 torch = [
     { index = "pytorch-cu130" },
 ]
+quack-kernels = { path = "/home/ubuntu/quack", editable = true }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"

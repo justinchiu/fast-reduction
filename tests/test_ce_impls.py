@@ -112,3 +112,73 @@ def test_batch_shapes():
     assert ce.shape == (batch, seq)
     assert ent.shape == (batch, seq)
     assert lp.shape == (batch, seq)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_finalize_kernel():
+    """Standalone finalization kernel: merge hand-computed partials."""
+    from fast_reduction.gemm_ce_entropy_finalize import finalize_ce_entropy
+
+    torch.manual_seed(42)
+    M, V = 128, 1024
+    N_tiles = 4
+
+    # Create fake logits and compute ground truth
+    logits = torch.randn(M, V, device="cuda", dtype=torch.float32)
+    target = torch.randint(0, V, (M,), device="cuda")
+
+    # Ground truth via PyTorch
+    log_sm = F.log_softmax(logits, dim=-1)
+    sm = log_sm.exp()
+    lse_ref = torch.logsumexp(logits, dim=-1)
+    ce_ref = F.nll_loss(log_sm, target, reduction="none")
+    ent_ref = -(sm * log_sm).sum(dim=-1)
+
+    # Simulate N_tiles partials (split logits into chunks along N)
+    chunk_n = (V + N_tiles - 1) // N_tiles
+    partials = torch.zeros(N_tiles, M, 4, device="cuda", dtype=torch.float32)
+
+    for t in range(N_tiles):
+        n_start = t * chunk_n
+        n_end = min(n_start + chunk_n, V)
+        chunk = logits[:, n_start:n_end]  # (M, chunk_n)
+
+        partials[t, :, 0] = chunk.max(dim=-1).values
+        partials[t, :, 1] = torch.exp(chunk - partials[t, :, 0:1]).sum(dim=-1)
+        partials[t, :, 2] = (chunk * torch.exp(chunk - partials[t, :, 0:1])).sum(dim=-1)
+
+        # Target logit: only in the tile containing the target
+        mask = (target >= n_start) & (target < n_end)
+        local_idx = target - n_start
+        local_idx = local_idx.clamp(0, n_end - n_start - 1)
+        target_vals = chunk[torch.arange(M, device="cuda"), local_idx]
+        partials[t, :, 3] = torch.where(mask, target_vals, torch.zeros_like(target_vals))
+
+    loss, entropy = finalize_ce_entropy(partials, N_tiles)
+
+    torch.testing.assert_close(loss, ce_ref, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(entropy, ent_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_gemm_fused_matches_baseline():
+    """Level 5 GEMM epilogue fused CE+entropy matches baseline."""
+    from fast_reduction.gemm_kernel import gemm_fused_ce_entropy
+
+    torch.manual_seed(123)
+    # Use sizes divisible by 8 for TMA alignment
+    B, H, V = 256, 128, 1024
+    hidden = torch.randn(B, H, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(V, H, device="cuda", dtype=torch.bfloat16)
+    target = torch.randint(0, V, (B,), device="cuda")
+
+    ce_fused, ent_fused, lp_fused = gemm_fused_ce_entropy(
+        hidden, weight, target, chunk_size=B,
+    )
+    ce_base, ent_base, lp_base = baseline_linear_xent_entropy(
+        hidden.cpu().float(), weight.cpu().float(), target.cpu(),
+    )
+
+    torch.testing.assert_close(ce_fused.cpu(), ce_base, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(ent_fused.cpu(), ent_base, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lp_fused.cpu(), lp_base, atol=1e-2, rtol=1e-2)
