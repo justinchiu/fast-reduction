@@ -1,0 +1,33 @@
+[project]
+name = "fast-reduction"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "apache-tvm-ffi>=0.1.9",
+    "nvidia-cutlass-dsl>=4.4.1",
+    "torch>=2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.uv.sources]
+# Install torch from the CUDA-enabled index.
+# Adjust the cu* suffix to match your CUDA version.
+torch = [
+    { index = "pytorch-cu130" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
