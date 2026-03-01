@@ -42,17 +42,35 @@ The `CrossEntropyOnly` kernel does not compute `x * exp_x`, so it can keep `-inf
 Zero extra cost: no additional ops, no extra SMEM round-trips, compiled away for
 aligned V via `const_expr`.
 
-## Remaining Issue
+## Remaining Issue — FIXED
 
-The sentinel fix eliminates NaN but does **not** fix a separate accuracy problem
-in the CuTe entropy kernels at large V (128256):
+The sentinel fix eliminated NaN, but a separate accuracy problem remained in the
+CuTe entropy kernels at large V (128256):
 
-| Kernel | Ent MAE (vs fp32 ref) |
-|--------|-----------------------|
-| EntropyOnly (Level 3) | 2690 |
-| CrossEntropyEntropy (Level 4) | 3.6 |
-| torch log_softmax (Levels 1-2) | 0.029 |
-| GEMM epilogue (Level 5) | 0.00002 |
+| Kernel | Ent MAE (before) | Ent MAE (after) |
+|--------|-----------------|-----------------|
+| EntropyOnly (Level 3) | 2690 | 0.000002 |
+| CrossEntropyEntropy (Level 4) | 3.6 | 0.000002 |
+| torch log_softmax (Levels 1-2) | 0.029 | 0.029 |
+| GEMM epilogue (Level 5) | 0.00002 | 0.00002 |
 
-The entropy error at large V is a separate numerical issue (likely in the
-cross-cluster reduction or `rcp_approx` precision), not caused by the OOB fill.
+### Root cause: mbarrier phase reuse in 3-pass cluster reduction
+
+Both entropy kernels perform 3 reduction passes (max, sum_exp, sum_x_exp) but
+only allocated 2 mbarrier stages (`self.stage = 2`). Pass 3 reused `mbar_ptr + 0`
+(same as pass 1) with `phase=0`, but that phase had already been consumed by
+pass 1. After pass 1, the mbarrier phase advances to 1, so `mbarrier_wait(phase=0)`
+in pass 3 **returned immediately with stale data** — reading max values from pass 1
+instead of the sum_x_exp values from pass 3.
+
+This only manifests when `cluster_n > 1` (V > 16384), which is why small-V tests
+passed. The block-level reduction path uses `__syncthreads()` which has no phase
+semantics, so cluster_n=1 was unaffected.
+
+### Fix
+
+1. Increased `self.stage` from 2 to 3 in `EntropyOnly` and `CrossEntropyEntropy`,
+   giving each reduction pass its own buffer slot and mbarrier.
+2. Changed pass 3 to use `reduction_buffer[..., 2]` and `mbar_ptr + 2`.
+3. Replaced `rcp_approx(sum_exp)` with proper division (`/ sum_exp`) in the
+   entropy formula for maximum precision.

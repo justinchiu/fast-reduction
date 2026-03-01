@@ -60,11 +60,12 @@ fast_reduction/
   gemm_kernel.py                Level 5 driver
 
 benchmarks/
-  bench_linear_xent_entropy.py   wall-clock, peak mem, model BW (all 5 levels)
+  bench_linear_xent_entropy.py   wall-clock, peak mem, model BW, accuracy (all 6 levels)
   profile.sh                     Nsight Compute profiling script
 
 tests/
   test_ce_impls.py         correctness tests vs PyTorch reference
+  test_entropy_large_v.py  large-V entropy accuracy tests (cluster reduction)
 
 docs/
   memory_bound_kernels.md  reference blogpost (Guo, Zadouri, Dao)
@@ -81,7 +82,8 @@ uv run pytest tests/test_ce_impls.py -v
 
 ```bash
 uv run python benchmarks/bench_linear_xent_entropy.py
-uv run python benchmarks/bench_linear_xent_entropy.py --B 65536 --V 128256 --H 4096
+uv run python benchmarks/bench_linear_xent_entropy.py --B 32768 --V 128256 --H 4096
+uv run python benchmarks/bench_linear_xent_entropy.py --no-accuracy   # speed/memory only
 ```
 
 ## API

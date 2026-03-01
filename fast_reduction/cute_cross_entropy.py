@@ -302,6 +302,10 @@ class EntropyOnly(_KernelBase):
     3 reductions: max, sum_exp, sum(x * exp(x - max)).  Writes entropy[M].
     """
 
+    def __init__(self, dtype: Type[cutlass.Numeric], N: int):
+        super().__init__(dtype, N)
+        self.stage = 3  # 3 passes need 3 mbarrier stages to avoid phase reuse
+
     @cute.jit
     def __call__(
         self,
@@ -406,8 +410,8 @@ class EntropyOnly(_KernelBase):
         x_times_exp = x * exp_x
         sum_x_exp = row_reduce(
             x_times_exp, cute.ReductionOp.ADD, threads_per_row,
-            reduction_buffer[None, None, 0],
-            mbar_ptr + 0 if const_expr(self.cluster_n > 1) else None,
+            reduction_buffer[None, None, 2],
+            mbar_ptr + 2 if const_expr(self.cluster_n > 1) else None,
             init_val=0.0,
         )
 
@@ -418,7 +422,7 @@ class EntropyOnly(_KernelBase):
             and (self.cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0)
         ):
             lse = max_x + cute.math.log(sum_exp, fastmath=True)
-            ent = lse - sum_x_exp * cute.arch.rcp_approx(sum_exp)
+            ent = lse - sum_x_exp / sum_exp
             mEntropy[row] = mEntropy.element_type(ent)
 
 
@@ -430,6 +434,10 @@ class CrossEntropyEntropy(_KernelBase):
     3 reductions: max, sum_exp, sum(x * exp(x - max)).
     Writes both loss[M] and entropy[M].
     """
+
+    def __init__(self, dtype: Type[cutlass.Numeric], N: int):
+        super().__init__(dtype, N)
+        self.stage = 3  # 3 passes need 3 mbarrier stages to avoid phase reuse
 
     @cute.jit
     def __call__(
@@ -542,8 +550,8 @@ class CrossEntropyEntropy(_KernelBase):
         x_times_exp = x * exp_x
         sum_x_exp = row_reduce(
             x_times_exp, cute.ReductionOp.ADD, threads_per_row,
-            reduction_buffer[None, None, 0],
-            mbar_ptr + 0 if const_expr(self.cluster_n > 1) else None,
+            reduction_buffer[None, None, 2],
+            mbar_ptr + 2 if const_expr(self.cluster_n > 1) else None,
             init_val=0.0,
         )
 
@@ -562,7 +570,7 @@ class CrossEntropyEntropy(_KernelBase):
             lse = max_x + cute.math.log(sum_exp, fastmath=True)
             ce_loss = (lse - target_logit) if not should_ignore else Float32.zero
             mLoss[row] = mLoss.element_type(ce_loss)
-            ent = lse - sum_x_exp * cute.arch.rcp_approx(sum_exp)
+            ent = lse - sum_x_exp / sum_exp
             mEntropy[row] = mEntropy.element_type(ent)
 
 

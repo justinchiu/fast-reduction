@@ -8,17 +8,14 @@ B=32768, H=4096, V=128256, bf16, chunk=4096, on a single H100 80GB:
 
 | Level | Variant | Time | Peak mem | CE MAE | Ent MAE |
 |-------|---------|------|----------|--------|---------|
-| 1 | torch unfused | 118 ms | 57 GB | 0.482 | 0.028 |
-| 2 | torch chunked | 114 ms | 10 GB | 0.482 | 0.028 |
-| 3 | CuTe separate | 74 ms | 5.3 GB | 0.482 | NaN* |
-| 4 | CuTe joint | 69 ms | 5.3 GB | 0.482 | NaN* |
-| 5 | GEMM epilogue | 66 ms | 1.3 GB | 0.0012 | 0.00002 |
-| 5.2 | GEMM epilogue v2 | 68 ms | 1.3 GB | 0.0012 | 0.00002 |
+| 1 | torch unfused | 113 ms | 56 GB | 0.481 | 0.029 |
+| 2 | torch chunked | 112 ms | 10 GB | 0.481 | 0.029 |
+| 3 | CuTe separate | 76 ms | 5.2 GB | 0.481 | 0.029 |
+| 4 | CuTe joint | 71 ms | 5.2 GB | 0.481 | 0.029 |
+| 5 | GEMM epilogue | 67 ms | 1.3 GB | 0.0012 | 0.00002 |
+| 5.2 | GEMM epilogue v2 | 70 ms | 1.3 GB | 0.0012 | 0.00002 |
 
 Error is MAE vs fp32 ground truth (fp32 matmul + fp32 reduction).
-
-\* Levels 3-4 produce NaN entropy at V=128256 with bf16 logits (pre-existing
-CuTe reduction kernel issue).
 
 ## Why Level 5 Is 400x More Precise
 
@@ -32,7 +29,7 @@ avoids bf16 truncation entirely, giving CE MAE ≈ 0.0012.
 
 | | Logit precision | CE MAE | Ent MAE |
 |---|---|---|---|
-| Levels 1-4 (bf16 logits from HBM) | bf16 (8-bit mantissa) | 0.482 | 0.028 |
+| Levels 1-4 (bf16 logits from HBM) | bf16 (8-bit mantissa) | 0.481 | 0.029 |
 | Level 5 (fp32 acc from registers) | fp32 (23-bit mantissa) | 0.0012 | 0.00002 |
 
 ## Level 5 Error Decomposition
@@ -75,6 +72,7 @@ benchmarks/
 
 tests/
   test_ce_impls.py
+  test_entropy_large_v.py               # large-V entropy accuracy tests
 
 docs/
   memory_bound_kernels.md

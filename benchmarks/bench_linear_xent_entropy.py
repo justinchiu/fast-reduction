@@ -1,17 +1,21 @@
 """
 Benchmark: linear + cross-entropy + entropy
 
-Compares 4 levels of fusion:
+Compares 6 levels of fusion:
   1. torch unfused        — full [B,V] logits, separate ops
   2. torch chunked        — chunked [chunk,V], separate ops
-  3. quack separate       — chunked matmul + 2 CuTe kernels (xent, entropy)
-  4. quack joint          — chunked matmul + 1 CuTe kernel (xent+entropy)
+  3. CuTe separate        — chunked matmul + 2 CuTe kernels (xent, entropy)
+  4. CuTe joint           — chunked matmul + 1 CuTe kernel (xent+entropy)
+  5. GEMM epilogue        — reduction fused into GEMM epilogue (single-pass)
+  5.2 GEMM epilogue v2    — two-pass epilogue
 
-Reports wall-clock time, peak memory, and model memory throughput.
+Reports wall-clock time, peak memory, model memory throughput, and accuracy
+(CE MAE, Ent MAE) vs fp32 ground truth.
 
 Usage:
     uv run python benchmarks/bench_linear_xent_entropy.py
     uv run python benchmarks/bench_linear_xent_entropy.py --B 65536 --V 128256 --H 4096
+    uv run python benchmarks/bench_linear_xent_entropy.py --no-accuracy   # skip error measurement
 """
 
 import argparse
@@ -68,9 +72,37 @@ def benchmark_fn(fn, warmup=5, iters=20):
     return elapsed_ms, peak
 
 
-def report(name, ms, peak, min_bytes):
+def compute_fp32_reference(hidden, weight, target):
+    """fp32 matmul + fp32 reduction ground truth."""
+    logits = F.linear(hidden.float(), weight.float())
+    log_sm = F.log_softmax(logits, dim=-1)
+    sm = log_sm.exp()
+    ce = F.nll_loss(log_sm, target, reduction="none")
+    ent = -(sm * log_sm).sum(dim=-1)
+    return ce, ent
+
+
+def compute_errors(ce, ent, ce_ref, ent_ref):
+    """Returns (ce_mae, ent_mae) as floats."""
+    ce_mae = (ce.float().cpu() - ce_ref.cpu()).abs().mean().item()
+    ent_mae = (ent.float().cpu() - ent_ref.cpu()).abs().mean().item()
+    return ce_mae, ent_mae
+
+
+def fmt_err(val):
+    if val is None:
+        return "—"
+    if val < 0.0001:
+        return f"{val:.1e}"
+    return f"{val:.4f}"
+
+
+def report(name, ms, peak, min_bytes, ce_mae=None, ent_mae=None):
     bw = min_bytes / (ms / 1000) / 1e9 if ms > 0 else 0
-    print(f"  {name:40s}  {ms:8.2f} ms  {bytes_to_mb(peak):8.0f} MB  {bw:6.0f} GB/s")
+    print(
+        f"  {name:40s}  {ms:8.2f} ms  {bytes_to_gb(peak):6.1f} GB"
+        f"  {bw:6.0f} GB/s  {fmt_err(ce_mae):>10s}  {fmt_err(ent_mae):>10s}"
+    )
 
 
 def main():
@@ -82,6 +114,7 @@ def main():
     parser.add_argument("--chunk", type=int, default=4096, help="chunk size for chunked variants")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--no-accuracy", action="store_true", help="skip accuracy measurement")
     args = parser.parse_args()
 
     B, H, V = args.B, args.H, args.V
@@ -90,6 +123,7 @@ def main():
     dtype_bytes = 4 if dtype == torch.float32 else 2
 
     device = "cuda"
+    torch.manual_seed(42)
     hidden = torch.randn(B, H, device=device, dtype=dtype)
     weight = torch.randn(V, H, device=device, dtype=dtype)
     target = torch.randint(0, V, (B,), device=device, dtype=torch.long)
@@ -97,50 +131,100 @@ def main():
     min_bytes = model_memory_bytes(B, V, H, dtype_bytes)
     logits_size = B * V * dtype_bytes
 
-    print(f"B={B}  H={H}  V={V}  dtype={args.dtype}  chunk={chunk}")
+    # Compute fp32 reference for accuracy (chunked to limit peak memory)
+    ce_ref = ent_ref = None
+    if not args.no_accuracy:
+        print("Computing fp32 ground truth (chunked)...")
+        ce_ref_parts = []
+        ent_ref_parts = []
+        ref_chunk = min(2048, B)
+        for start in range(0, B, ref_chunk):
+            end = min(start + ref_chunk, B)
+            ce_r, ent_r = compute_fp32_reference(
+                hidden[start:end], weight, target[start:end]
+            )
+            ce_ref_parts.append(ce_r)
+            ent_ref_parts.append(ent_r)
+        ce_ref = torch.cat(ce_ref_parts)
+        ent_ref = torch.cat(ent_ref_parts)
+        del ce_ref_parts, ent_ref_parts
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    print(f"\nB={B}  H={H}  V={V}  dtype={args.dtype}  chunk={chunk}")
     print(f"Full logits [B,V] = {bytes_to_gb(logits_size):.2f} GB")
     print(f"Chunk logits [chunk,V] = {bytes_to_mb(chunk * V * dtype_bytes):.0f} MB")
     print(f"Minimum model bytes = {bytes_to_mb(min_bytes):.0f} MB")
     print(f"H100 HBM3 peak = 3350 GB/s")
     print()
-    print(f"  {'variant':40s}  {'time':>8s}  {'peak mem':>8s}  {'model BW':>8s}")
-    print(f"  {'-'*40}  {'-'*8}  {'-'*8}  {'-'*8}")
+    print(
+        f"  {'variant':40s}  {'time':>8s}  {'peak':>6s}"
+        f"  {'model BW':>8s}  {'CE MAE':>10s}  {'Ent MAE':>10s}"
+    )
+    print(f"  {'-'*40}  {'-'*8}  {'-'*6}  {'-'*8}  {'-'*10}  {'-'*10}")
+
+    variants = []
 
     # 1. torch unfused
     def run_unfused():
         return baseline_linear_xent_entropy(hidden, weight, target)
     ms, peak = benchmark_fn(run_unfused, args.warmup, args.iters)
-    report("1. torch unfused", ms, peak, min_bytes)
+    ce_mae = ent_mae = None
+    if ce_ref is not None:
+        ce, ent, _ = run_unfused()
+        ce_mae, ent_mae = compute_errors(ce, ent, ce_ref, ent_ref)
+    report("1. torch unfused", ms, peak, min_bytes, ce_mae, ent_mae)
+    variants.append(("1. torch unfused", ms, peak, ce_mae, ent_mae))
 
     # 2. torch chunked
     def run_chunked():
         return chunked_linear_xent_entropy(hidden, weight, target, chunk_size=chunk)
     ms, peak = benchmark_fn(run_chunked, args.warmup, args.iters)
-    report("2. torch chunked", ms, peak, min_bytes)
+    if ce_ref is not None:
+        ce, ent, _ = run_chunked()
+        ce_mae, ent_mae = compute_errors(ce, ent, ce_ref, ent_ref)
+    report("2. torch chunked", ms, peak, min_bytes, ce_mae, ent_mae)
+    variants.append(("2. torch chunked", ms, peak, ce_mae, ent_mae))
 
     # 3. CuTe separate (xent kernel + entropy kernel, two reads of logits)
     def run_separate():
         return separate_linear_xent_entropy(hidden, weight, target, chunk_size=chunk)
     ms, peak = benchmark_fn(run_separate, args.warmup, args.iters)
-    report("3. CuTe separate xent + entropy", ms, peak, min_bytes)
+    if ce_ref is not None:
+        ce, ent, _ = run_separate()
+        ce_mae, ent_mae = compute_errors(ce, ent, ce_ref, ent_ref)
+    report("3. CuTe separate xent + entropy", ms, peak, min_bytes, ce_mae, ent_mae)
+    variants.append(("3. CuTe separate", ms, peak, ce_mae, ent_mae))
 
     # 4. CuTe joint xent+entropy (one read of logits)
     def run_joint():
         return fused_linear_xent_entropy(hidden, weight, target, chunk_size=chunk)
     ms, peak = benchmark_fn(run_joint, args.warmup, args.iters)
-    report("4. CuTe joint xent+entropy", ms, peak, min_bytes)
+    if ce_ref is not None:
+        ce, ent, _ = run_joint()
+        ce_mae, ent_mae = compute_errors(ce, ent, ce_ref, ent_ref)
+    report("4. CuTe joint xent+entropy", ms, peak, min_bytes, ce_mae, ent_mae)
+    variants.append(("4. CuTe joint", ms, peak, ce_mae, ent_mae))
 
     # 5. GEMM epilogue fused CE+entropy (logits never hit HBM)
     def run_gemm_fused():
         return gemm_fused_ce_entropy(hidden, weight, target, chunk_size=chunk)
     ms, peak = benchmark_fn(run_gemm_fused, args.warmup, args.iters)
-    report("5. GEMM epilogue fused CE+entropy", ms, peak, min_bytes)
+    if ce_ref is not None:
+        ce, ent, _ = run_gemm_fused()
+        ce_mae, ent_mae = compute_errors(ce, ent, ce_ref, ent_ref)
+    report("5. GEMM epilogue fused CE+entropy", ms, peak, min_bytes, ce_mae, ent_mae)
+    variants.append(("5. GEMM epilogue", ms, peak, ce_mae, ent_mae))
 
     # 5.2 GEMM epilogue v2: two-pass for improved precision
     def run_gemm_fused_v2():
         return gemm_fused_ce_entropy_v2(hidden, weight, target, chunk_size=chunk)
     ms, peak = benchmark_fn(run_gemm_fused_v2, args.warmup, args.iters)
-    report("5.2 GEMM epilogue v2 (two-pass)", ms, peak, min_bytes)
+    if ce_ref is not None:
+        ce, ent, _ = run_gemm_fused_v2()
+        ce_mae, ent_mae = compute_errors(ce, ent, ce_ref, ent_ref)
+    report("5.2 GEMM epilogue v2 (two-pass)", ms, peak, min_bytes, ce_mae, ent_mae)
+    variants.append(("5.2 GEMM epilogue v2", ms, peak, ce_mae, ent_mae))
 
     print()
 
