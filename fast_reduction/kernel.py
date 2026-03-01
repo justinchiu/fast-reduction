@@ -47,9 +47,32 @@ def fused_linear_xent_entropy(
     ce_loss = torch.empty(B, device=hidden_2d.device, dtype=torch.float32)
     entropy = torch.empty(B, device=hidden_2d.device, dtype=torch.float32)
 
+    # Apples-to-apples matmul path: keep GEMM in input dtype (e.g., bf16)
+    # when hidden/weight dtypes match and are GEMM-friendly. Fallback to fp32
+    # only for mixed/unsupported dtype combinations.
+    use_native_mm_dtype = (
+        hidden_2d.dtype == weight.dtype
+        and hidden_2d.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    )
+    mm_dtype = hidden_2d.dtype if use_native_mm_dtype else torch.float32
+    weight_t = (
+        weight.t().contiguous()
+        if use_native_mm_dtype
+        else weight.float().t().contiguous()
+    )
+    bias_for_mm = None if bias is None else bias.to(dtype=mm_dtype)
+
     # Pre-allocate logits buffer (reused every chunk)
     actual_chunk = min(chunk_size, B)
-    logits_buf = torch.empty(actual_chunk, V, device=hidden_2d.device, dtype=torch.float32)
+    logits_mm_buf = torch.empty(
+        actual_chunk, V, device=hidden_2d.device, dtype=mm_dtype
+    )
+    # CuTe reduction needs fp32 logits. If matmul is bf16, upcast once.
+    logits_reduce_buf = (
+        logits_mm_buf
+        if mm_dtype == torch.float32
+        else torch.empty(actual_chunk, V, device=hidden_2d.device, dtype=torch.float32)
+    )
 
     for start in range(0, B, chunk_size):
         end = min(start + chunk_size, B)
@@ -57,15 +80,21 @@ def fused_linear_xent_entropy(
         t_chunk = target_1d[start:end]
         chunk_len = end - start
 
-        logits_chunk = logits_buf[:chunk_len]
+        logits_chunk_mm = logits_mm_buf[:chunk_len]
+        h_chunk_mm = h_chunk if use_native_mm_dtype else h_chunk.float()
         torch.mm(
-            h_chunk.float() if hidden_2d.dtype != torch.float32 else h_chunk,
-            weight.float().t() if weight.dtype != torch.float32 else weight.t(),
-            out=logits_chunk,
+            h_chunk_mm,
+            weight_t,
+            out=logits_chunk_mm,
         )
 
-        if bias is not None:
-            logits_chunk = logits_chunk + bias.float()
+        if bias_for_mm is not None:
+            logits_chunk_mm.add_(bias_for_mm)
+
+        logits_chunk = logits_chunk_mm
+        if mm_dtype != torch.float32:
+            logits_chunk = logits_reduce_buf[:chunk_len]
+            logits_chunk.copy_(logits_chunk_mm)
 
         # CuTe DSL kernel: one pass over [chunk_len, V] -> (loss, entropy)
         loss_chunk, ent_chunk = ce_entropy_fwd(logits_chunk, t_chunk)
@@ -103,8 +132,27 @@ def separate_linear_xent_entropy(
     ce_loss = torch.empty(B, device=hidden_2d.device, dtype=torch.float32)
     entropy = torch.empty(B, device=hidden_2d.device, dtype=torch.float32)
 
+    use_native_mm_dtype = (
+        hidden_2d.dtype == weight.dtype
+        and hidden_2d.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    )
+    mm_dtype = hidden_2d.dtype if use_native_mm_dtype else torch.float32
+    weight_t = (
+        weight.t().contiguous()
+        if use_native_mm_dtype
+        else weight.float().t().contiguous()
+    )
+    bias_for_mm = None if bias is None else bias.to(dtype=mm_dtype)
+
     actual_chunk = min(chunk_size, B)
-    logits_buf = torch.empty(actual_chunk, V, device=hidden_2d.device, dtype=torch.float32)
+    logits_mm_buf = torch.empty(
+        actual_chunk, V, device=hidden_2d.device, dtype=mm_dtype
+    )
+    logits_reduce_buf = (
+        logits_mm_buf
+        if mm_dtype == torch.float32
+        else torch.empty(actual_chunk, V, device=hidden_2d.device, dtype=torch.float32)
+    )
 
     for start in range(0, B, chunk_size):
         end = min(start + chunk_size, B)
@@ -112,15 +160,21 @@ def separate_linear_xent_entropy(
         t_chunk = target_1d[start:end]
         chunk_len = end - start
 
-        logits_chunk = logits_buf[:chunk_len]
+        logits_chunk_mm = logits_mm_buf[:chunk_len]
+        h_chunk_mm = h_chunk if use_native_mm_dtype else h_chunk.float()
         torch.mm(
-            h_chunk.float() if hidden_2d.dtype != torch.float32 else h_chunk,
-            weight.float().t() if weight.dtype != torch.float32 else weight.t(),
-            out=logits_chunk,
+            h_chunk_mm,
+            weight_t,
+            out=logits_chunk_mm,
         )
 
-        if bias is not None:
-            logits_chunk = logits_chunk + bias.float()
+        if bias_for_mm is not None:
+            logits_chunk_mm.add_(bias_for_mm)
+
+        logits_chunk = logits_chunk_mm
+        if mm_dtype != torch.float32:
+            logits_chunk = logits_reduce_buf[:chunk_len]
+            logits_chunk.copy_(logits_chunk_mm)
 
         # Two separate kernel launches — each reads logits independently
         ce_loss[start:end] = ce_fwd(logits_chunk, t_chunk)

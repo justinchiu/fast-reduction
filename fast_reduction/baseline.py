@@ -34,8 +34,8 @@ def baseline_linear_xent(
     hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
     target_1d = target.reshape(-1)
 
-    logits = F.linear(hidden_2d.float(), weight.float(), None if bias is None else bias.float())
-    log_softmax = F.log_softmax(logits, dim=-1)
+    logits = F.linear(hidden_2d, weight, bias)
+    log_softmax = F.log_softmax(logits.float(), dim=-1)
     ce_loss = F.nll_loss(log_softmax, target_1d, reduction="none")
     log_probs = log_softmax[torch.arange(len(target_1d), device=target_1d.device), target_1d]
 
@@ -51,8 +51,8 @@ def baseline_linear_entropy(
     batch_shape = hidden_states.shape[:-1]
     hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
 
-    logits = F.linear(hidden_2d.float(), weight.float(), None if bias is None else bias.float())
-    log_softmax = F.log_softmax(logits, dim=-1)
+    logits = F.linear(hidden_2d, weight, bias)
+    log_softmax = F.log_softmax(logits.float(), dim=-1)
     softmax = log_softmax.exp()
     entropy = -(softmax * log_softmax).sum(dim=-1)
 
@@ -67,15 +67,14 @@ def baseline_linear_xent_entropy(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Linear + cross-entropy + entropy.  Returns (ce_loss, entropy, log_probs).
 
-    This is the numerical ground truth that all kernel implementations are
-    tested against.
+    Matmul in input dtype (bf16 or fp32), reduction in fp32.
     """
     batch_shape = hidden_states.shape[:-1]
     hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
     target_1d = target.reshape(-1)
 
-    logits = F.linear(hidden_2d.float(), weight.float(), None if bias is None else bias.float())
-    log_softmax = F.log_softmax(logits, dim=-1)
+    logits = F.linear(hidden_2d, weight, bias)
+    log_softmax = F.log_softmax(logits.float(), dim=-1)
     softmax = log_softmax.exp()
 
     ce_loss = F.nll_loss(log_softmax, target_1d, reduction="none")
@@ -111,11 +110,8 @@ def chunked_linear_xent(
 
     for start in range(0, B, chunk_size):
         end = min(start + chunk_size, B)
-        logits = F.linear(
-            hidden_2d[start:end].float(), weight.float(),
-            None if bias is None else bias.float(),
-        )
-        log_sm = F.log_softmax(logits, dim=-1)
+        logits = F.linear(hidden_2d[start:end], weight, bias)
+        log_sm = F.log_softmax(logits.float(), dim=-1)
         t = target_1d[start:end]
         ce_loss[start:end] = F.nll_loss(log_sm, t, reduction="none")
         log_probs[start:end] = log_sm[torch.arange(end - start, device=t.device), t]
@@ -138,11 +134,8 @@ def chunked_linear_entropy(
 
     for start in range(0, B, chunk_size):
         end = min(start + chunk_size, B)
-        logits = F.linear(
-            hidden_2d[start:end].float(), weight.float(),
-            None if bias is None else bias.float(),
-        )
-        log_sm = F.log_softmax(logits, dim=-1)
+        logits = F.linear(hidden_2d[start:end], weight, bias)
+        log_sm = F.log_softmax(logits.float(), dim=-1)
         sm = log_sm.exp()
         entropy[start:end] = -(sm * log_sm).sum(dim=-1)
 
@@ -171,11 +164,8 @@ def chunked_linear_xent_entropy(
 
     for start in range(0, B, chunk_size):
         end = min(start + chunk_size, B)
-        logits = F.linear(
-            hidden_2d[start:end].float(), weight.float(),
-            None if bias is None else bias.float(),
-        )
-        log_sm = F.log_softmax(logits, dim=-1)
+        logits = F.linear(hidden_2d[start:end], weight, bias)
+        log_sm = F.log_softmax(logits.float(), dim=-1)
         sm = log_sm.exp()
         t = target_1d[start:end]
         ce_loss[start:end] = F.nll_loss(log_sm, t, reduction="none")

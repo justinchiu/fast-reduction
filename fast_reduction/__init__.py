@@ -17,6 +17,7 @@ __all__ = [
     "chunked_linear_xent_entropy",
     "fused_linear_xent_entropy",
     "gemm_fused_ce_entropy",
+    "gemm_fused_ce_entropy_v2",
 ]
 
 
@@ -24,4 +25,7 @@ def __getattr__(name):
     if name == "gemm_fused_ce_entropy":
         from fast_reduction.gemm_kernel import gemm_fused_ce_entropy
         return gemm_fused_ce_entropy
+    if name == "gemm_fused_ce_entropy_v2":
+        from fast_reduction.gemm_kernel import gemm_fused_ce_entropy_v2
+        return gemm_fused_ce_entropy_v2
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

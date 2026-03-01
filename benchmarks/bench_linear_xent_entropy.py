@@ -26,7 +26,7 @@ from fast_reduction.baseline import (
     chunked_linear_xent_entropy,
 )
 from fast_reduction.kernel import fused_linear_xent_entropy, separate_linear_xent_entropy
-from fast_reduction.gemm_kernel import gemm_fused_ce_entropy
+from fast_reduction.gemm_kernel import gemm_fused_ce_entropy, gemm_fused_ce_entropy_v2
 
 
 def bytes_to_gb(b: int) -> float:
@@ -135,6 +135,12 @@ def main():
         return gemm_fused_ce_entropy(hidden, weight, target, chunk_size=chunk)
     ms, peak = benchmark_fn(run_gemm_fused, args.warmup, args.iters)
     report("5. GEMM epilogue fused CE+entropy", ms, peak, min_bytes)
+
+    # 5.2 GEMM epilogue v2: two-pass for improved precision
+    def run_gemm_fused_v2():
+        return gemm_fused_ce_entropy_v2(hidden, weight, target, chunk_size=chunk)
+    ms, peak = benchmark_fn(run_gemm_fused_v2, args.warmup, args.iters)
+    report("5.2 GEMM epilogue v2 (two-pass)", ms, peak, min_bytes)
 
     print()
 

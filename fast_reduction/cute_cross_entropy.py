@@ -371,7 +371,9 @@ class EntropyOnly(_KernelBase):
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         if const_expr(not is_even_N):
-            cute_utils.fill_oob(tXsX, tXpX, -tXsX.element_type.inf)
+            # Use finite sentinel (not -inf) so x*exp(x-max) = -1e4*0 = -0
+            # instead of -inf*0 = NaN.
+            cute_utils.fill_oob(tXsX, tXpX, tXsX.element_type(-1e4))
         cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(Float32)
 
@@ -505,7 +507,9 @@ class CrossEntropyEntropy(_KernelBase):
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         if const_expr(not is_even_N):
-            cute_utils.fill_oob(tXsX, tXpX, -tXsX.element_type.inf)
+            # Use finite sentinel (not -inf) so x*exp(x-max) = -1e4*0 = -0
+            # instead of -inf*0 = NaN.
+            cute_utils.fill_oob(tXsX, tXpX, tXsX.element_type(-1e4))
         cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(Float32)
 
