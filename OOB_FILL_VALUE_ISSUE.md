@@ -57,11 +57,28 @@ CuTe entropy kernels at large V (128256):
 ### Root cause: mbarrier phase reuse in 3-pass cluster reduction
 
 Both entropy kernels perform 3 reduction passes (max, sum_exp, sum_x_exp) but
-only allocated 2 mbarrier stages (`self.stage = 2`). Pass 3 reused `mbar_ptr + 0`
-(same as pass 1) with `phase=0`, but that phase had already been consumed by
-pass 1. After pass 1, the mbarrier phase advances to 1, so `mbarrier_wait(phase=0)`
-in pass 3 **returned immediately with stale data** — reading max values from pass 1
-instead of the sum_x_exp values from pass 3.
+only allocated 2 mbarrier stages (`self.stage = 2`). The passes were assigned:
+
+```python
+# Pass 1 (max):      buffer slot 0, mbar_ptr + 0, waits phase 0  ✓
+max_x = row_reduce(x, ..., reduction_buffer[None, None, 0],
+                   mbar_ptr + 0, ...)
+
+# Pass 2 (sum_exp):  buffer slot 1, mbar_ptr + 1, waits phase 0  ✓
+sum_exp = row_reduce(exp_x, ..., reduction_buffer[None, None, 1],
+                     mbar_ptr + 1, ...)
+
+# Pass 3 (sum_x_exp): buffer slot 0, mbar_ptr + 0, waits phase 0  ✗ BUG
+sum_x_exp = row_reduce(x_times_exp, ..., reduction_buffer[None, None, 0],
+                       mbar_ptr + 0, ...)
+```
+
+Inside `cluster_reduce`, each pass ends with `mbarrier_wait(mbar_ptr, phase=0)`.
+After pass 1 completes, `mbar_ptr + 0`'s phase advances to 1. When pass 3 reuses
+`mbar_ptr + 0` and waits on phase 0, that phase is **already completed** — the
+wait returns immediately before pass 3's async DSMEM stores have landed. The
+thread reads **stale max values from pass 1** instead of sum_x_exp, so entropy
+computes `lse - max_x / sum_exp` instead of `lse - sum_x_exp / sum_exp`.
 
 This only manifests when `cluster_n > 1` (V > 16384), which is why small-V tests
 passed. The block-level reduction path uses `__syncthreads()` which has no phase
@@ -69,8 +86,37 @@ semantics, so cluster_n=1 was unaffected.
 
 ### Fix
 
-1. Increased `self.stage` from 2 to 3 in `EntropyOnly` and `CrossEntropyEntropy`,
-   giving each reduction pass its own buffer slot and mbarrier.
-2. Changed pass 3 to use `reduction_buffer[..., 2]` and `mbar_ptr + 2`.
-3. Replaced `rcp_approx(sum_exp)` with proper division (`/ sum_exp`) in the
-   entropy formula for maximum precision.
+**1. Allocate 3 stages instead of 2** so each pass gets its own mbarrier and
+buffer slot:
+
+```python
+class EntropyOnly(_KernelBase):
+    def __init__(self, dtype, N):
+        super().__init__(dtype, N)
+        self.stage = 3  # was 2
+
+class CrossEntropyEntropy(_KernelBase):
+    def __init__(self, dtype, N):
+        super().__init__(dtype, N)
+        self.stage = 3
+```
+
+**2. Point pass 3 at the new slot 2** (instead of reusing slot 0):
+
+```python
+# Before:
+sum_x_exp = row_reduce(..., reduction_buffer[None, None, 0],
+                       mbar_ptr + 0, ...)
+# After:
+sum_x_exp = row_reduce(..., reduction_buffer[None, None, 2],
+                       mbar_ptr + 2, ...)
+```
+
+**3. Replace approximate reciprocal with exact division:**
+
+```python
+# Before:
+ent = lse - sum_x_exp * cute.arch.rcp_approx(sum_exp)
+# After:
+ent = lse - sum_x_exp / sum_exp
+```
