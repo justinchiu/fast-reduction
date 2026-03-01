@@ -19,7 +19,7 @@ Five levels of fusion, measured at B=32768, H=4096, V=128256, bf16, chunk=4096:
 | 2 | torch chunked | 723 ms | 11 GB | Chunked [chunk,V], same PyTorch ops |
 | 3 | CuTe separate | 680 ms | 5.4 GB | Chunked matmul + 2 CuTe kernels (CE, entropy) |
 | 4 | CuTe joint | 675 ms | 5.4 GB | Chunked matmul + 1 CuTe kernel (CE+entropy) |
-| 5 | GEMM epilogue | — | — | Reduction fused into GEMM epilogue (logits never hit HBM) |
+| 5 | GEMM epilogue | 68 ms | 1.3 GB | Reduction fused into GEMM epilogue (logits never hit HBM) |
 
 **CuTe reduction kernels alone** (no matmul, B=4096, V=128256, fp32):
 
@@ -54,10 +54,14 @@ fast_reduction/
   kernel.py                chunked matmul + CuTe reduction (levels 3 & 4)
   cute_cross_entropy.py    CuTe DSL kernels: CE-only, entropy-only, joint CE+entropy
   reduce.py                reduction primitives (thread → warp → block → cluster)
-  dsl_utils.py             low-level PTX: DSMEM, f32↔i64 packing, pointer arithmetic
+  cute_utils.py             low-level PTX: DSMEM, f32↔i64 packing, pointer arithmetic
+  gemm_ce_entropy_epilogue.py   Level 5 GEMM epilogue mixin
+  gemm_ce_entropy_finalize.py   Level 5 finalization kernel
+  gemm_kernel.py                Level 5 driver
 
 benchmarks/
-  bench_linear_xent_entropy.py   wall-clock, peak mem, model BW (all 4 levels)
+  bench_linear_xent_entropy.py   wall-clock, peak mem, model BW (all 5 levels)
+  profile.sh                     Nsight Compute profiling script
 
 tests/
   test_ce_impls.py         correctness tests vs PyTorch reference
@@ -112,6 +116,34 @@ dependencies = [
     "torch>=2.5",
 ]
 ```
+
+## GPU Usage
+
+This machine has 8 x H100 GPUs. Always use an idle GPU for experiments to avoid
+interfering with other work.
+
+### Check GPU utilization
+
+```bash
+# Quick check: shows index, utilization %, memory used/total
+nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader
+
+# Full dashboard
+nvidia-smi
+```
+
+### Run on a specific unused GPU
+
+```bash
+# Run on GPU 1
+CUDA_VISIBLE_DEVICES=1 uv run python benchmarks/bench_linear_xent_entropy.py
+
+# Run on GPU 3
+CUDA_VISIBLE_DEVICES=3 uv run pytest tests/test_ce_impls.py -v
+```
+
+Always check `nvidia-smi` first, pick a GPU with 0% utilization and 0 MB used,
+then prefix your command with `CUDA_VISIBLE_DEVICES=<gpu_id>`.
 
 ## Reference
 
