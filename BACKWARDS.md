@@ -2,22 +2,26 @@
 
 ## Current Status
 
-Phase 1 (reference backward) and Phase 2 (chunked PyTorch-ops backward) are complete.
-The backward is **correct** but **slow** — same speed for Level 4 and Level 5 because
-both recompute logits via `torch.mm` and use unfused PyTorch element-wise ops for dlogits.
+Phases 1-3 complete. Phase 3 implemented the quack/liger interleaved pattern for Level 4,
+achieving a 25% speedup. Level 5 fast backward provides no speedup because WGMMA and cuBLAS
+produce different logits (LSE mismatch prevents reuse).
 
-Next: Phase 3 — fuse dlogits into the forward CuTe kernel (quack/liger pattern).
+Next: CuTe backward kernel for dlogits (fuse 4 element-wise passes → 1 kernel).
 
-## Current Backward Performance (B=32768, H=4096, V=128256, bf16, chunk=4096)
+## Performance (B=32768, H=4096, V=128256, bf16, chunk=4096)
 
 | Level | Variant | Fwd (ms) | Fwd+Bwd (ms) | Peak mem | CE MAE | dH MAE |
 |-------|---------|----------|---------------|----------|--------|--------|
 | 1 | torch unfused | OOM | OOM | — | — | — |
-| 2 | torch chunked | 722 | 1437 | 11.0 GB | 0.0000 | 0.0000 |
-| 4 | CuTe joint | 675 | 1101 | 13.9 GB | 0.0001 | 0.0007 |
-| 5 | GEMM epilogue | 68 | 495 | 13.9 GB | 0.0012 | 0.0018 |
+| 2 | torch chunked | 112 | 308 | 38.5 GB | 0.4807 | 0.0335 |
+| 4 | CuTe joint (slow) | 70 | 351 | 14.5 GB | 0.4807 | 0.0335 |
+| **4F** | **CuTe joint (fast)** | **—** | **262** | **13.5 GB** | **0.4807** | **0.0335** |
+| 5 | GEMM epilogue (slow) | 67 | 346 | 14.5 GB | 0.0012 | 0.0438 |
+| 5F | GEMM epilogue (fast) | — | 348 | 14.5 GB | 0.0012 | 0.0438 |
 
-L4 and L5 backward are identical (same code path). L5's forward advantage doesn't help.
+**Level 4 fast is the best fwd+bwd path** at 262ms — 25% faster than Level 4 slow,
+15% faster than torch chunked. Level 5 fast provides no speedup because backward
+must recompute logits via cuBLAS regardless.
 
 ## Per-Chunk Backward Profiling (chunk=4096, V=128256)
 
@@ -109,145 +113,66 @@ This eliminates:
 - logsumexp recomputation (~4.4ms/chunk)
 - Multiple unfused HBM round-trips for element-wise dlogits (~14ms/chunk → 0)
 
-## Plan: Phase 3 — Fused Backward
+## Phase 3 Implementation: Interleaved Forward+Backward
 
-### Approach
+### What Was Implemented
 
-Modify the forward to compute dlogits during the CuTe kernel, then compute
-d_hidden/d_weight immediately in the same forward loop.
+Following the quack/liger pattern, Phase 3 interleaves forward and backward in a
+single chunked loop. For Level 4, this avoids logits recomputation and uses pre-computed
+LSE from the CuTe kernel.
 
-### Step 1: CuTe kernel variant that outputs dlogits
-
-Modify `CrossEntropyEntropy` in `cute_cross_entropy.py` (or add a new class) to
-output dlogits in-place over the logits buffer.
-
-The kernel already computes `p_j` (softmax) and `log_p_j` during the online reduction.
-At the end, after writing loss and entropy, also write:
-
+**Level 4 fast path** (`fused_linear_xent_entropy_fast`):
 ```python
-# For default g_ce=1, g_ent=-1:
-dlogits_j = p_j * (1 + log_p_j + H) - 1{j=target}
+for chunk:
+    logits = h_chunk @ W.T                                # forward matmul
+    loss, ent, lse = ce_entropy_fwd_with_lse(logits, t)   # CuTe kernel (with LSE output)
+    dlogits = _compute_dlogits_from_lse(logits, t, lse, ent)  # no logsumexp recompute
+    d_hidden[chunk] = dlogits @ W                          # backward matmul
+    d_weight += dlogits.T @ h_chunk                        # accumulate
 ```
 
-For general upstream gradients, write the "unscaled" form:
-```python
-dlogits_j = p_j          # at non-target positions
-dlogits_j = p_j - 1.0    # at target position
-```
-This is the CE-only gradient. The entropy contribution (`-p_j * (log_p_j + H)`)
-can be written to a second output or combined. However, since both quack and liger
-only handle CE (not CE+entropy), we need to extend their pattern.
+The autograd.Function (`FusedLinearXentEntropyFast`) returns `(scalar_loss, ce_detached, ent_detached)`.
+Backward just scales pre-computed d_hidden/d_weight by the upstream dloss scalar.
 
-**Option A: Write CE-dlogits + save log_p and H for entropy dlogits.**
-Forward kernel outputs `p_j - 1{j=y}` in-place. Backward (if needed for non-trivial
-upstream) reads this plus saved `log_p_j` and `H` to reconstruct full dlogits.
-Problem: log_p is [M,V], too large to save.
+### Why Level 5 Fast Doesn't Help
 
-**Option B: Write combined dlogits for fixed g_ce=1, g_ent=-1.**
-Forward kernel outputs `p_j * (1 + log_p_j + H) - 1{j=y}` in-place. Backward
-just scales d_hidden and d_weight by the upstream scalar. This only works for the
-standard loss = ce.sum() - ent.sum(). For other upstream shapes, fall back to
-the current recompute path.
+Level 5 forward uses WGMMA (custom matmul in GEMM epilogue) which produces slightly
+different logits than cuBLAS. At V=128256, the LSE difference is ~0.48 MAE. Using
+WGMMA LSE with cuBLAS-recomputed logits produces inconsistent softmax (doesn't sum to 1),
+causing d_hidden MAE of ~0.89 — unacceptable.
 
-**Option C: Write softmax `p_j` to dlogits buffer, save entropy `H`.**
-Forward kernel overwrites logits with `p_j`. Backward reads `p_j`, computes
-`log_p_j = log(p_j)`, then assembles full dlogits:
-`dlogits_j = g_ce*(p_j - 1{j=y}) + g_ent*(-p_j*(log_p_j + H))`
-This is element-wise but needs only 1 HBM read of [M,V] (softmax), not
-recomputing logits+logsumexp. Saves ~10ms/chunk vs current, costs ~4ms/chunk
-for the element-wise pass.
+The Level 5 fast path must use cuBLAS logsumexp for consistency, eliminating the LSE
+reuse benefit. The remaining benefit (single-loop structure) provides negligible speedup.
 
-**Recommended: Option B** for the common case, with **Option C as fallback**.
+### What Saves Time in Level 4
 
-### Step 2: Restructure forward loop
+Per chunk at V=128256:
+- **Logits recomputation avoided**: 6ms saved (shared with forward in same loop)
+- **logsumexp avoided**: 4.4ms saved (uses CuTe kernel LSE output)
+- Element-wise dlogits: ~10ms (still 4 PyTorch ops, reduced from 5)
+- d_hidden matmul: 4.8ms (unchanged)
+- d_weight matmul: 4.3ms (unchanged)
 
-```python
-def fused_linear_xent_entropy_fwd_bwd(hidden, weight, target, chunk_size):
-    d_hidden = empty_like(hidden)
-    d_weight = zeros(V, H, fp32)
+Total savings: ~10.4ms/chunk × 8 chunks = ~83ms → matches observed 89ms improvement.
 
-    for chunk:
-        logits = h_chunk @ W.T                              # matmul
-        loss, ent = ce_entropy_fwd_bwd(logits, target)      # CuTe kernel, writes dlogits in-place
-        d_hidden[chunk] = logits @ W                        # logits buffer now contains dlogits
-        d_weight += logits.T @ h_chunk                      # accumulate
+### Future Optimization: CuTe Backward Kernel
 
-    return ce, entropy, d_hidden, d_weight
-```
-
-### Step 3: Simplify autograd.Function backward
-
-```python
-class FusedLinearXentEntropy(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, hidden, weight, target, bias, chunk_size):
-        ce, ent, log_probs, d_hidden, d_weight = fused_fwd_bwd(...)
-        ctx.save_for_backward(d_hidden, d_weight)
-        return ce, ent, log_probs
-
-    @staticmethod
-    def backward(ctx, g_ce, g_ent, g_lp):
-        d_hidden, d_weight = ctx.saved_tensors
-        # For loss = ce.sum() - ent.sum(), dloss = 1.0
-        # d_hidden and d_weight already contain the correct gradients
-        # If upstream isn't uniform 1.0, need to scale or fall back
-        return d_hidden, d_weight, None, d_bias, None
-```
-
-### Step 4: Level 5 extension
-
-For Level 5 (GEMM epilogue), the epilogue kernel already has `p_j` and `log_p_j`
-available in registers. Extend `epi_visit_subtile()` to also write dlogits to
-the output buffer. Then the driver loop immediately does the d_hidden and d_weight
-matmuls.
-
-### Memory Trade-off
-
-Pre-computing gradients means saving during forward:
-- `d_hidden [B,H]`: 256 MB at B=32768, H=4096, bf16
-- `d_weight [V,H]`: 1 GB at V=128256, H=4096, bf16
-
-Total: ~1.3 GB extra vs current recompute approach (which saves only entropy [B] = 128KB).
-
-This is acceptable — both quack and liger make this trade-off because the backward
-speedup (3-4x) far outweighs the memory cost. And peak memory is still much less
-than the unfused baseline (65 GB).
-
-### Expected Performance
-
-Per chunk (V=128256, chunk=4096):
-- Forward CuTe kernel + dlogits: ~0.8ms (marginal cost over forward-only)
-- d_hidden matmul: ~4.8ms
-- d_weight matmul: ~4.3ms
-- **Total per chunk: ~10ms** (vs ~34ms currently)
-
-Full B=32768, 8 chunks:
-- **Fwd+Bwd: ~80ms** for the reduction part
-- Plus matmul forward time: ~675ms (L4) or ~68ms (L5)
-- **Expected L4 total: ~755ms** (vs 1101ms currently, 1.5x speedup)
-- **Expected L5 total: ~148ms** (vs 495ms currently, 3.3x speedup)
+The remaining bottleneck is 4 unfused element-wise passes for dlogits (~10ms/chunk).
+A CuTe kernel fusing `sub(lse) → exp → mul(factor) → scatter(target)` into one pass
+would reduce this to ~1ms/chunk, saving ~72ms total.
 
 ## Implementation Files
 
 | File | Changes |
 |------|---------|
-| `fast_reduction/cute_cross_entropy.py` | Add `ce_entropy_fwd_bwd` variant that outputs dlogits in-place |
-| `fast_reduction/kernel.py` | Restructure forward loop to compute d_hidden/d_weight during forward |
-| `fast_reduction/gemm_kernel.py` | Extend Level 5 epilogue to output dlogits |
-| `fast_reduction/gemm_ce_entropy_epilogue.py` | Add dlogits output to epilogue mixin |
-| `tests/test_backward.py` | Update tests for new path |
-| `benchmarks/bench_fwd_bwd.py` | Re-benchmark |
-
-## Current Implementation (Phase 2)
-
-### Files Modified
-
-- `fast_reduction/baseline.py` — Added `baseline_linear_xent_entropy_backward()`
-- `fast_reduction/kernel.py` — Added `_compute_dlogits_chunk()`, `fused_linear_xent_entropy_backward()`, `FusedLinearXentEntropy`, `fused_linear_xent_entropy_differentiable()`
-- `fast_reduction/gemm_kernel.py` — Added `GemmFusedCEEntropy`, `gemm_fused_ce_entropy_differentiable()`
-- `fast_reduction/__init__.py` — Updated exports
-- `tests/test_backward.py` — 11 tests across 3 classes
-- `benchmarks/bench_fwd_bwd.py` — Forward+backward benchmark
+| `fast_reduction/cute_cross_entropy.py` | Added LSE output to `CrossEntropyEntropy`, `ce_entropy_fwd_with_lse()` |
+| `fast_reduction/kernel.py` | Added `_compute_dlogits_from_lse()`, `_fused_fwd_bwd()`, `FusedLinearXentEntropyFast`, `fused_linear_xent_entropy_fast()` |
+| `fast_reduction/gemm_kernel.py` | Added `_gemm_fused_fwd_bwd()`, `GemmFusedCEEntropyFast`, `gemm_fused_ce_entropy_fast()` |
+| `fast_reduction/gemm_ce_entropy_finalize.py` | Added LSE output to `Finalize`, `finalize_ce_entropy_with_lse()` |
+| `fast_reduction/baseline.py` | `baseline_linear_xent_entropy_backward()` (Phase 2) |
+| `fast_reduction/__init__.py` | Updated exports |
+| `tests/test_backward.py` | 17 tests (3 reference + 6 level4 + 2 level5 + 6 fast) |
+| `benchmarks/bench_fwd_bwd.py` | Forward+backward benchmark with fast variants |
 
 ### Running Tests
 
