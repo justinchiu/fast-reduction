@@ -1,0 +1,144 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+
+\title{Backward Math: Fast-Reduction and Liger Linear}
+\date{March 2, 2026}
+
+\begin{document}
+\maketitle
+
+\section{Notation}
+Let
+\begin{align}
+X &\in \mathbb{R}^{B \times d}, &
+W &\in \mathbb{R}^{V \times d}, &
+b &\in \mathbb{R}^{V}, \\
+Z &= XW^\top + \mathbf{1}b^\top \in \mathbb{R}^{B \times V}.
+\end{align}
+For row $n$ and class $j$:
+\begin{align}
+p_{nj} &= \mathrm{softmax}(z_n)_j
+= \frac{e^{z_{nj}}}{\sum_k e^{z_{nk}}}, \\
+\log p_{nj} &= z_{nj} - \log \sum_k e^{z_{nk}}.
+\end{align}
+
+\section{Fast-Reduction Backward (CE + Entropy + Log-Prob)}
+Per-row outputs:
+\begin{align}
+\ell_n^{\mathrm{ce}} &= -\log p_{n,t_n}, \\
+\ell_n^{\mathrm{ent}} &= -\sum_j p_{nj}\log p_{nj}, \\
+\ell_n^{\log p} &= \log p_{n,t_n} = -\ell_n^{\mathrm{ce}}.
+\end{align}
+
+Given upstream row gradients
+$g_n^{\mathrm{ce}}, g_n^{\mathrm{ent}}, g_n^{\log p}$,
+define
+\begin{align}
+\tilde g_n^{\mathrm{ce}} = g_n^{\mathrm{ce}} - g_n^{\log p}.
+\end{align}
+
+The logit gradient for row $n$ is
+\begin{align}
+\frac{\partial L}{\partial z_{nj}}
+&=
+\tilde g_n^{\mathrm{ce}}
+\left(p_{nj} - \mathbf{1}[j=t_n]\right)
+ + g_n^{\mathrm{ent}}
+\left(-p_{nj}\left(\log p_{nj} + H_n\right)\right),
+\end{align}
+where
+\begin{align}
+H_n = -\sum_j p_{nj}\log p_{nj}.
+\end{align}
+
+Equivalent matrix form:
+\begin{align}
+D_Z[n,j]
+&=
+\tilde g_n^{\mathrm{ce}}\left(p_{nj} - Y_{nj}\right)
++ g_n^{\mathrm{ent}}\left(-p_{nj}(\log p_{nj} + H_n)\right),
+\end{align}
+with one-hot $Y_{n,t_n}=1$.
+
+If a row is ignored (e.g.\ $t_n < 0$), CE/log-prob contribution is set to zero:
+\begin{align}
+\tilde g_n^{\mathrm{ce}}\left(p_{nj} - \mathbf{1}[j=t_n]\right) \gets 0.
+\end{align}
+
+Then linear gradients are standard:
+\begin{align}
+D_X &= D_Z W, \\
+D_W &= D_Z^\top X, \\
+D_b &= \sum_{n=1}^B D_Z[n,:].
+\end{align}
+
+\section{Liger Chunked Linear Cross-Entropy Backward}
+This section describes the chunked linear-CE path used by
+\texttt{linear\_cross\_entropy.py} (no entropy term).
+
+\subsection{Objective}
+\begin{align}
+\ell_n &= -\log p_{n,t_n}, \\
+L_{\mathrm{sum}} &= \sum_{n \in \mathcal{V}} \ell_n,
+\end{align}
+where $\mathcal{V}$ excludes \texttt{ignore\_index}.
+Returned loss is either:
+\begin{align}
+L = L_{\mathrm{sum}}
+\quad \text{or} \quad
+L = \frac{1}{|\mathcal{V}|}L_{\mathrm{sum}}.
+\end{align}
+
+\subsection{What is done in forward}
+For each chunk $c$ with inputs $X_c$ and targets $t_c$:
+\begin{align}
+Z_c &= X_c W^\top, \\
+D_c &= \frac{\partial \ell_c}{\partial Z_c}
+= P_c - Y_c, \\
+\widehat D_{X,c} &= D_c W.
+\end{align}
+
+The implementation precomputes and stores $\widehat D_{X,c}$ for all chunks.
+It also accumulates weight-gradient partials for all non-last chunks:
+\begin{align}
+G_{\mathrm{partial}} = \sum_{c \neq c_{\mathrm{last}}} D_c^\top X_c,
+\end{align}
+and saves $(D_{c_{\mathrm{last}}}, X_{c_{\mathrm{last}}})$ for the autograd
+backward.
+
+\subsection{Autograd backward step}
+Backward receives scalar upstream $g = \frac{\partial \mathcal{L}}{\partial L}$.
+Let
+\begin{align}
+s =
+\begin{cases}
+1, & \text{reduction=sum}, \\
+\frac{1}{|\mathcal{V}|}, & \text{reduction=mean},
+\end{cases}
+\qquad
+\alpha = g\,s.
+\end{align}
+
+Then:
+\begin{align}
+D_X &= \alpha \,\widehat D_X, \\
+D_W &= \alpha\left(
+G_{\mathrm{partial}} + D_{c_{\mathrm{last}}}^\top X_{c_{\mathrm{last}}}
+\right).
+\end{align}
+
+So the heavy CE Jacobian work is done chunk-by-chunk in forward; backward
+mainly applies scalar scaling and finishes the deferred last chunk contribution.
+
+\section{Liger Linear (Plain Linear Layer) Backward}
+For $Y = XW^\top + b$ and upstream $D_Y$:
+\begin{align}
+D_X &= D_Y W, \\
+D_W &= D_Y^\top X, \\
+D_b &= \sum_n D_Y[n,:].
+\end{align}
+The implementation may optionally fuse in-place gradient accumulation into
+\texttt{weight.grad}, but the math is unchanged.
+
+\end{document}
