@@ -471,6 +471,108 @@ class TestFastBackward:
         assert ce.shape == (B,)
         assert ent.shape == (B,)
 
+    def test_level5_megakernel_matches_reference(self):
+        """Level 5 megakernel backward matches fp32 reference."""
+        from fast_reduction.gemm_kernel import gemm_megakernel_fast
+
+        torch.manual_seed(123)
+        B, H, V = 256, 128, 1024
+        hidden = torch.randn(B, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(V, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        target = torch.randint(0, V, (B,), device="cuda")
+
+        loss, ce, ent = gemm_megakernel_fast(
+            hidden, weight, target, chunk_size=B,
+        )
+        loss.backward()
+
+        _, _, d_hidden_ref, d_weight_ref, _ = _fp32_reference_grads(
+            hidden.detach().cpu(), weight.detach().cpu(), target.cpu(),
+        )
+
+        d_hidden_mae = (hidden.grad.float().cpu() - d_hidden_ref.float()).abs().mean()
+        d_weight_mae = (weight.grad.float().cpu() - d_weight_ref.float()).abs().mean()
+
+        assert d_hidden_mae < 0.05, f"d_hidden MAE={d_hidden_mae:.6f}"
+        assert d_weight_mae < 0.05, f"d_weight MAE={d_weight_mae:.6f}"
+
+    def test_level5_megakernel_matches_slow(self):
+        """Level 5 megakernel and standard L5 backward produce similar gradients."""
+        from fast_reduction.gemm_kernel import (
+            gemm_fused_ce_entropy_fast,
+            gemm_megakernel_fast,
+        )
+
+        torch.manual_seed(99)
+        B, H, V = 256, 128, 1024
+        hidden = torch.randn(B, H, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(V, H, device="cuda", dtype=torch.bfloat16)
+        target = torch.randint(0, V, (B,), device="cuda")
+
+        # Standard L5 fast
+        h_slow = hidden.clone().requires_grad_(True)
+        w_slow = weight.clone().requires_grad_(True)
+        loss1, _, _ = gemm_fused_ce_entropy_fast(h_slow, w_slow, target, chunk_size=B)
+        loss1.backward()
+
+        # Megakernel
+        h_mega = hidden.clone().requires_grad_(True)
+        w_mega = weight.clone().requires_grad_(True)
+        loss2, _, _ = gemm_megakernel_fast(h_mega, w_mega, target, chunk_size=B)
+        loss2.backward()
+
+        # Both use WGMMA logits, so gradients should be very close
+        dh_mae = (h_slow.grad.float() - h_mega.grad.float()).abs().mean()
+        dw_mae = (w_slow.grad.float() - w_mega.grad.float()).abs().mean()
+
+        assert dh_mae < 0.1, f"d_hidden cross-method MAE={dh_mae:.6f}"
+        assert dw_mae < 0.1, f"d_weight cross-method MAE={dw_mae:.6f}"
+
+    def test_megakernel_non_aligned_vocab(self):
+        """Megakernel backward works with non-power-of-2 vocab sizes."""
+        from fast_reduction.gemm_kernel import gemm_megakernel_fast
+
+        torch.manual_seed(777)
+        B, H, V = 256, 64, 1000
+        hidden = torch.randn(B, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(V, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        target = torch.randint(0, V, (B,), device="cuda")
+
+        loss, ce, ent = gemm_megakernel_fast(
+            hidden, weight, target, chunk_size=B,
+        )
+        loss.backward()
+
+        assert not torch.isnan(hidden.grad).any(), "d_hidden contains NaN"
+        assert not torch.isnan(weight.grad).any(), "d_weight contains NaN"
+
+        _, _, d_hidden_ref, d_weight_ref, _ = _fp32_reference_grads(
+            hidden.detach().cpu(), weight.detach().cpu(), target.cpu(),
+        )
+        d_hidden_mae = (hidden.grad.float().cpu() - d_hidden_ref.float()).abs().mean()
+        assert d_hidden_mae < 0.05, f"d_hidden MAE={d_hidden_mae:.6f}"
+
+    def test_megakernel_detached_outputs(self):
+        """Megakernel returns detached ce and ent (no grad)."""
+        from fast_reduction.gemm_kernel import gemm_megakernel_fast
+
+        torch.manual_seed(42)
+        B, H, V = 128, 64, 512
+        hidden = torch.randn(B, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(V, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        target = torch.randint(0, V, (B,), device="cuda")
+
+        loss, ce, ent = gemm_megakernel_fast(
+            hidden, weight, target, chunk_size=B,
+        )
+
+        assert loss.requires_grad
+        assert not ce.requires_grad
+        assert not ent.requires_grad
+        assert loss.dim() == 0
+        assert ce.shape == (B,)
+        assert ent.shape == (B,)
+
     def test_fast_chunked(self):
         """Fast backward works with chunk_size < B."""
         from fast_reduction.kernel import fused_linear_xent_entropy_fast

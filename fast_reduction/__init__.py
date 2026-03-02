@@ -30,6 +30,7 @@ __all__ = [
     "gemm_fused_ce_entropy_v2",
     "gemm_fused_ce_entropy_differentiable",
     "gemm_fused_ce_entropy_fast",
+    "gemm_megakernel_fast",
 ]
 
 
@@ -46,4 +47,7 @@ def __getattr__(name):
     if name == "gemm_fused_ce_entropy_fast":
         from fast_reduction.gemm_kernel import gemm_fused_ce_entropy_fast
         return gemm_fused_ce_entropy_fast
+    if name == "gemm_megakernel_fast":
+        from fast_reduction.gemm_kernel import gemm_megakernel_fast
+        return gemm_megakernel_fast
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

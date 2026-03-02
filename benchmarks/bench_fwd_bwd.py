@@ -40,6 +40,7 @@ from fast_reduction.kernel import (
 from fast_reduction.gemm_kernel import (
     gemm_fused_ce_entropy_differentiable,
     gemm_fused_ce_entropy_fast,
+    gemm_megakernel_fast,
 )
 
 
@@ -293,6 +294,25 @@ def main():
         ent_mae = (ent.float().cpu() - ent_ref).abs().mean().item()
         dh_mae = (h.grad.float().cpu() - d_hidden_ref.float()).abs().mean().item()
     report("5F. GEMM epilogue fast", 0, fwd_bwd_ms, peak, ce_mae, ent_mae, dh_mae)
+
+    # ---- 5M. GEMM megakernel (logits from epilogue + fused CuTe dlogits) ----
+    def run_megakernel_fwd_bwd():
+        h = hidden.detach().requires_grad_(True)
+        w = weight.detach().requires_grad_(True)
+        loss, ce, ent = gemm_megakernel_fast(
+            h, w, target, chunk_size=chunk,
+        )
+        loss.backward()
+        return ce, ent, h, w
+
+    fwd_bwd_ms, peak = benchmark_fn(run_megakernel_fwd_bwd, args.warmup, args.iters)
+    ce_mae = ent_mae = dh_mae = None
+    if ce_ref is not None:
+        ce, ent, h, w = run_megakernel_fwd_bwd()
+        ce_mae = (ce.float().cpu() - ce_ref).abs().mean().item()
+        ent_mae = (ent.float().cpu() - ent_ref).abs().mean().item()
+        dh_mae = (h.grad.float().cpu() - d_hidden_ref.float()).abs().mean().item()
+    report("5M. GEMM megakernel", 0, fwd_bwd_ms, peak, ce_mae, ent_mae, dh_mae)
 
     print()
 
