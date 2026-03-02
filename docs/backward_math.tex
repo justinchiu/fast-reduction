@@ -2,11 +2,21 @@
 \usepackage[margin=1in]{geometry}
 \usepackage{amsmath,amssymb,mathtools}
 
-\title{Backward Math: Fast-Reduction and Liger Linear}
+\title{Backward Math and Code Realization}
 \date{March 2, 2026}
 
 \begin{document}
 \maketitle
+
+\section{What This Is Based On}
+This note is grounded in the current local kernel implementations:
+\begin{itemize}
+\item \texttt{/home/ubuntu/fast-reduction/fast\_reduction/kernel.py}
+\item \texttt{/home/ubuntu/quack/quack/linear\_cross\_entropy.py}
+\item \texttt{/home/ubuntu/quack/quack/cross\_entropy.py}
+\item \texttt{/home/ubuntu/Liger-Kernel/src/liger\_kernel/ops/fused\_linear\_cross\_entropy.py}
+\item \texttt{/home/ubuntu/Liger-Kernel/src/liger\_kernel/ops/cross\_entropy.py}
+\end{itemize}
 
 \section{Notation}
 Let
@@ -23,7 +33,8 @@ p_{nj} &= \mathrm{softmax}(z_n)_j
 \log p_{nj} &= z_{nj} - \log \sum_k e^{z_{nk}}.
 \end{align}
 
-\section{Fast-Reduction Backward (CE + Entropy + Log-Prob)}
+\section{Fast-Reduction: CE + Entropy + Log-Prob Backward}
+\subsection{Math}
 Per-row outputs:
 \begin{align}
 \ell_n^{\mathrm{ce}} &= -\log p_{n,t_n}, \\
@@ -32,19 +43,18 @@ Per-row outputs:
 \end{align}
 
 Given upstream row gradients
-$g_n^{\mathrm{ce}}, g_n^{\mathrm{ent}}, g_n^{\log p}$,
-define
+$g_n^{\mathrm{ce}}, g_n^{\mathrm{ent}}, g_n^{\log p}$, define
 \begin{align}
 \tilde g_n^{\mathrm{ce}} = g_n^{\mathrm{ce}} - g_n^{\log p}.
 \end{align}
 
-The logit gradient for row $n$ is
+Then
 \begin{align}
 \frac{\partial L}{\partial z_{nj}}
-&=
+=
 \tilde g_n^{\mathrm{ce}}
 \left(p_{nj} - \mathbf{1}[j=t_n]\right)
- + g_n^{\mathrm{ent}}
++ g_n^{\mathrm{ent}}
 \left(-p_{nj}\left(\log p_{nj} + H_n\right)\right),
 \end{align}
 where
@@ -52,93 +62,139 @@ where
 H_n = -\sum_j p_{nj}\log p_{nj}.
 \end{align}
 
-Equivalent matrix form:
+Matrix form:
 \begin{align}
 D_Z[n,j]
-&=
+=
 \tilde g_n^{\mathrm{ce}}\left(p_{nj} - Y_{nj}\right)
-+ g_n^{\mathrm{ent}}\left(-p_{nj}(\log p_{nj} + H_n)\right),
-\end{align}
-with one-hot $Y_{n,t_n}=1$.
-
-If a row is ignored (e.g.\ $t_n < 0$), CE/log-prob contribution is set to zero:
-\begin{align}
-\tilde g_n^{\mathrm{ce}}\left(p_{nj} - \mathbf{1}[j=t_n]\right) \gets 0.
++ g_n^{\mathrm{ent}}\left(-p_{nj}(\log p_{nj} + H_n)\right).
 \end{align}
 
-Then linear gradients are standard:
+If a row is ignored (e.g.\ $t_n < 0$), the CE/log-prob term is zeroed.
+
+Linear gradients:
 \begin{align}
 D_X &= D_Z W, \\
 D_W &= D_Z^\top X, \\
 D_b &= \sum_{n=1}^B D_Z[n,:].
 \end{align}
 
-\section{Liger Chunked Linear Cross-Entropy Backward}
-This section describes the chunked linear-CE path used by
-\texttt{linear\_cross\_entropy.py} (no entropy term).
-
-\subsection{Objective}
+\subsection{How It Is Realized In Code}
+In \texttt{fast\_reduction/kernel.py}, function
+\texttt{\_compute\_dlogits\_chunk}:
+\begin{itemize}
+\item \texttt{lse = logsumexp(logits\_fp32)} and
+\texttt{logits\_fp32.sub\_(lse)} compute $\log p$ in-place.
+\item \texttt{row\_a = g\_ce - g\_ent * entropy}, \texttt{row\_b = -g\_ent}
+construct per-row coefficients so that
 \begin{align}
-\ell_n &= -\log p_{n,t_n}, \\
-L_{\mathrm{sum}} &= \sum_{n \in \mathcal{V}} \ell_n,
+D_Z = \exp(\log P)\odot(\texttt{row\_a} + \texttt{row\_b}\odot\log P).
 \end{align}
-where $\mathcal{V}$ excludes \texttt{ignore\_index}.
-Returned loss is either:
+\item \texttt{dlogits[arange, target] -= g\_ce} applies the
+$-\tilde g_n^{\mathrm{ce}}\mathbf{1}[j=t_n]$ term.
+\end{itemize}
+
+Then \texttt{fused\_linear\_xent\_entropy\_backward} performs chunked GEMMs:
 \begin{align}
-L = L_{\mathrm{sum}}
-\quad \text{or} \quad
-L = \frac{1}{|\mathcal{V}|}L_{\mathrm{sum}}.
+D_X^{(c)} &= D_Z^{(c)} W, \\
+D_W &\mathrel{+}= (D_Z^{(c)})^\top X^{(c)}, \\
+D_b &\mathrel{+}= \sum_{n\in c} D_Z[n,:].
 \end{align}
 
-\subsection{What is done in forward}
-For each chunk $c$ with inputs $X_c$ and targets $t_c$:
+\section{Quack: Chunked Linear Cross-Entropy Backward}
+\subsection{Math}
+Objective (no entropy term):
+\begin{align}
+\ell_n = -\log p_{n,t_n}, \qquad
+L_{\mathrm{sum}} = \sum_{n\in\mathcal{V}} \ell_n,
+\end{align}
+with $\mathcal{V}$ excluding \texttt{ignore\_index}.
+For CE:
+\begin{align}
+\frac{\partial \ell_n}{\partial z_{nj}} = p_{nj} - \mathbf{1}[j=t_n].
+\end{align}
+
+\subsection{How It Is Realized In Code}
+In \texttt{quack/linear\_cross\_entropy.py},
+\texttt{chunked\_linear\_cross\_entropy\_fwd} does, per chunk $c$:
 \begin{align}
 Z_c &= X_c W^\top, \\
 D_c &= \frac{\partial \ell_c}{\partial Z_c}
-= P_c - Y_c, \\
+\quad\text{(written in-place into logits buffer)}, \\
 \widehat D_{X,c} &= D_c W.
 \end{align}
+This uses \texttt{cross\_entropy\_fwd\_out(..., dx=dlogits\_chunk)} so CE
+gradient is produced during forward.
 
-The implementation precomputes and stores $\widehat D_{X,c}$ for all chunks.
-It also accumulates weight-gradient partials for all non-last chunks:
+Weight gradient accumulation is split:
 \begin{align}
-G_{\mathrm{partial}} = \sum_{c \neq c_{\mathrm{last}}} D_c^\top X_c,
-\end{align}
-and saves $(D_{c_{\mathrm{last}}}, X_{c_{\mathrm{last}}})$ for the autograd
-backward.
-
-\subsection{Autograd backward step}
-Backward receives scalar upstream $g = \frac{\partial \mathcal{L}}{\partial L}$.
-Let
-\begin{align}
-s =
-\begin{cases}
-1, & \text{reduction=sum}, \\
-\frac{1}{|\mathcal{V}|}, & \text{reduction=mean},
-\end{cases}
-\qquad
-\alpha = g\,s.
+G_{\mathrm{partial}} &= \sum_{c\neq c_{\mathrm{last}}} D_c^\top X_c, \\
+\text{save }(D_{c_{\mathrm{last}}}, X_{c_{\mathrm{last}}})&\text{ for backward}.
 \end{align}
 
-Then:
+In \texttt{ChunkedLinearCrossEntropyFunction.backward}, if scalar upstream is
+$g$, with reduction scale $s$ (\texttt{sum}: $1$, \texttt{mean}: $1/|\mathcal{V}|$):
 \begin{align}
-D_X &= \alpha \,\widehat D_X, \\
-D_W &= \alpha\left(
-G_{\mathrm{partial}} + D_{c_{\mathrm{last}}}^\top X_{c_{\mathrm{last}}}
-\right).
+\alpha &= gs, \\
+D_X &= \alpha\,\widehat D_X, \\
+D_W &= \alpha\left(G_{\mathrm{partial}} + D_{c_{\mathrm{last}}}^\top X_{c_{\mathrm{last}}}\right).
+\end{align}
+So backward is mostly scaling and finishing deferred $D_W$.
+
+For CE kernel internals, \texttt{quack/cross\_entropy.py}
+(\texttt{CrossEntropyBackward.kernel}) computes
+\begin{align}
+P = \exp(z-\mathrm{lse}),\quad
+D_Z = \mathrm{where}(j=t,\;P-1,\;P)\cdot d\ell,
+\end{align}
+via a vectorized boolean mask and \texttt{cute.where}.
+
+\section{Liger-Kernel: Fused Linear Cross-Entropy Backward}
+\subsection{Math}
+Core CE piece is the same:
+\begin{align}
+\frac{\partial \ell_n}{\partial z_{nj}} = p_{nj} - \mathbf{1}[j=t_n],
+\end{align}
+with optional additions for class weights, label smoothing, softcapping, and
+z-loss.
+
+\subsection{How It Is Realized In Code}
+In \texttt{liger\_kernel/ops/fused\_linear\_cross\_entropy.py},
+\texttt{fused\_linear\_cross\_entropy\_forward} loops over token chunks and:
+\begin{align}
+Z_c &= X_c W^\top (+b), \\
+D_c &= \frac{\partial \ell_c}{\partial Z_c}
+\quad\text{(written in-place by Triton kernel)}, \\
+D_{X,c} &= D_c W, \\
+D_W &\mathrel{+}= D_c^\top X_c, \\
+D_b &\mathrel{+}= \sum_{n\in c} D_c[n,:].
 \end{align}
 
-So the heavy CE Jacobian work is done chunk-by-chunk in forward; backward
-mainly applies scalar scaling and finishes the deferred last chunk contribution.
+The Triton kernel \texttt{liger\_cross\_entropy\_kernel} in
+\texttt{liger\_kernel/ops/cross\_entropy.py} uses:
+\begin{itemize}
+\item Pass 1: online softmax stats $(m,d)$ and optional argmax.
+\item Pass 2: writes $\partial L/\partial Z$ back to \texttt{X\_ptr}.
+\item Then computes/stores loss (plus optional z-loss/metrics).
+\end{itemize}
 
-\section{Liger Linear (Plain Linear Layer) Backward}
-For $Y = XW^\top + b$ and upstream $D_Y$:
+Autograd behavior:
+\begin{itemize}
+\item \texttt{LigerFusedLinearCrossEntropyFunction.forward} stores
+precomputed $(D_X,D_W,D_b)$.
+\item \texttt{backward} calls
+\texttt{fused\_linear\_cross\_entropy\_backward}, which only rescales stored
+grads by scalar upstream \texttt{grad\_output} (using
+\texttt{element\_mul\_kernel}); if \texttt{grad\_output == 1}, scaling is skipped.
+\end{itemize}
+
+\section{Quack Plain Linear Backward (Reference)}
+For plain linear $Y=XW^\top+b$, quack's \texttt{linear.py} follows:
 \begin{align}
 D_X &= D_Y W, \\
 D_W &= D_Y^\top X, \\
-D_b &= \sum_n D_Y[n,:].
+D_b &= \sum_n D_Y[n,:],
 \end{align}
-The implementation may optionally fuse in-place gradient accumulation into
-\texttt{weight.grad}, but the math is unchanged.
+with an optional in-place accumulation path for \texttt{weight.grad}; math is unchanged.
 
 \end{document}
