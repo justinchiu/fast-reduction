@@ -21,6 +21,8 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from typing import Optional
+
 from cutlass import Int32, Float32, const_expr
 
 
@@ -39,11 +41,12 @@ class Finalize:
         mPartials: cute.Tensor,   # (N_tiles, M, 4) fp32
         mLoss: cute.Tensor,       # (M,) fp32
         mEntropy: cute.Tensor,    # (M,) fp32
+        mLSE: Optional[cute.Tensor],  # (M,) fp32, optional LSE output
         n_tiles: Int32,           # number of N tiles to merge
         stream: cuda.CUstream,
     ):
         M = mPartials.shape[1]
-        self.kernel(mPartials, mLoss, mEntropy, n_tiles).launch(
+        self.kernel(mPartials, mLoss, mEntropy, mLSE, n_tiles).launch(
             grid=[cute.ceil_div(M, self.BLOCK_M), 1, 1],
             block=[self.BLOCK_M, 1, 1],
             stream=stream,
@@ -55,6 +58,7 @@ class Finalize:
         mPartials: cute.Tensor,   # (N_tiles, M, 4)
         mLoss: cute.Tensor,       # (M,)
         mEntropy: cute.Tensor,    # (M,)
+        mLSE: Optional[cute.Tensor],  # (M,)
         n_tiles: Int32,
     ):
         tidx = cute.arch.thread_idx()[0]
@@ -94,6 +98,8 @@ class Finalize:
 
             mLoss[row] = ce_loss
             mEntropy[row] = entropy
+            if const_expr(mLSE is not None):
+                mLSE[row] = lse
 
 
 # ---- compile cache and torch wrapper ----
@@ -124,15 +130,37 @@ def finalize_ce_entropy_out(
     n_tiles: int,
 ) -> None:
     """Merge partial reductions -> loss + entropy."""
+    _finalize_ce_entropy_impl(partials, loss, entropy, n_tiles, lse=None)
+
+
+@torch.library.custom_op(
+    "fast_reduction::finalize_ce_entropy_lse",
+    mutates_args={"loss", "entropy", "lse"},
+)
+def finalize_ce_entropy_lse_out(
+    partials: Tensor,   # (N_tiles, M, 4) fp32
+    loss: Tensor,       # (M,) fp32
+    entropy: Tensor,    # (M,) fp32
+    lse: Tensor,        # (M,) fp32
+    n_tiles: int,
+) -> None:
+    """Merge partial reductions -> loss + entropy + lse."""
+    _finalize_ce_entropy_impl(partials, loss, entropy, n_tiles, lse=lse)
+
+
+def _finalize_ce_entropy_impl(partials, loss, entropy, n_tiles, lse=None):
+    """Shared implementation for finalize with/without LSE output."""
     assert partials.dim() == 3 and partials.size(2) == 4
     assert partials.is_cuda
-    key = "finalize"
+    has_lse = lse is not None
+    key = ("finalize", has_lse)
     if key not in _compile_cache_finalize:
         M_sym = cute.sym_int()
         N_tiles_sym = cute.sym_int()
         partials_fake = _make_fake_tensor(Float32, (N_tiles_sym, M_sym, 4))
         loss_fake = _make_fake_tensor(Float32, (M_sym,))
         entropy_fake = _make_fake_tensor(Float32, (M_sym,))
+        lse_fake = _make_fake_tensor(Float32, (M_sym,)) if has_lse else None
         n_tiles_val = Int32(0)
         op = Finalize()
         _compile_cache_finalize[key] = cute.compile(
@@ -140,11 +168,15 @@ def finalize_ce_entropy_out(
             partials_fake,
             loss_fake,
             entropy_fake,
+            lse_fake,
             n_tiles_val,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
-    _compile_cache_finalize[key](partials, loss, entropy, n_tiles)
+    if has_lse:
+        _compile_cache_finalize[key](partials, loss, entropy, lse, n_tiles)
+    else:
+        _compile_cache_finalize[key](partials, loss, entropy, None, n_tiles)
 
 
 def finalize_ce_entropy(
@@ -161,3 +193,20 @@ def finalize_ce_entropy(
     entropy = torch.empty(M, device=partials.device, dtype=torch.float32)
     finalize_ce_entropy_out(partials, loss, entropy, n_tiles)
     return loss, entropy
+
+
+def finalize_ce_entropy_with_lse(
+    partials: Tensor,
+    n_tiles: int,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Merge partial reductions -> (loss, entropy, lse).
+
+    partials: (N_tiles, M, 4) fp32
+    Returns: (loss [M], entropy [M], lse [M]) all fp32
+    """
+    M = partials.size(1)
+    loss = torch.empty(M, device=partials.device, dtype=torch.float32)
+    entropy = torch.empty(M, device=partials.device, dtype=torch.float32)
+    lse = torch.empty(M, device=partials.device, dtype=torch.float32)
+    finalize_ce_entropy_lse_out(partials, loss, entropy, lse, n_tiles)
+    return loss, entropy, lse

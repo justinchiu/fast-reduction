@@ -35,10 +35,14 @@ from quack.gemm_wrapper_utils import GemmWrapperBase, GemmTensorInfo
 
 from fast_reduction.gemm_ce_entropy_epilogue import GemmCEEntropySm90
 from fast_reduction.gemm_ce_entropy_epilogue_v2 import GemmCEEntropyV2Sm90
-from fast_reduction.gemm_ce_entropy_finalize import finalize_ce_entropy
+from fast_reduction.gemm_ce_entropy_finalize import (
+    finalize_ce_entropy,
+    finalize_ce_entropy_with_lse,
+)
 from fast_reduction.kernel import (
     _mm_setup,
     _compute_dlogits_chunk,
+    _compute_dlogits_from_lse,
     fused_linear_xent_entropy_backward,
 )
 
@@ -465,3 +469,185 @@ def gemm_fused_ce_entropy_differentiable(
     Same interface, but supports .backward() on the returned tensors.
     """
     return GemmFusedCEEntropy.apply(hidden_states, weight, target, bias, chunk_size)
+
+
+# ========================================================================
+# Level 5 fast backward: GEMM forward + interleaved backward
+# ========================================================================
+
+def _gemm_fused_fwd_bwd(
+    hidden_states: Tensor,
+    weight: Tensor,
+    target: Tensor,
+    bias: Optional[Tensor] = None,
+    chunk_size: int = 4096,
+    ce_weight: float = 1.0,
+    ent_weight: float = -1.0,
+    tile_M: int = 128,
+    tile_N: int = 256,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
+    """Level 5 forward + backward in one pass.
+
+    Forward: GEMM epilogue → partials → finalize (with LSE).
+    Backward: recompute logits via cuBLAS → dlogits using saved LSE →
+              d_hidden, d_weight matmuls.
+
+    Returns: (ce_loss, entropy, d_hidden, d_weight, d_bias)
+    """
+    batch_shape = hidden_states.shape[:-1]
+    hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1]).contiguous()
+    target_1d = target.reshape(-1)
+    B, H = hidden_2d.shape
+    V = weight.shape[0]
+
+    ce_loss = torch.empty(B, device=hidden_2d.device, dtype=torch.float32)
+    entropy = torch.empty(B, device=hidden_2d.device, dtype=torch.float32)
+    d_hidden = torch.empty_like(hidden_2d)
+    d_weight = torch.zeros(V, H, device=hidden_2d.device, dtype=torch.float32)
+    d_bias = None
+    if bias is not None:
+        d_bias = torch.zeros(V, device=hidden_2d.device, dtype=torch.float32)
+
+    use_native, mm_dtype, weight_t, bias_for_mm = _mm_setup(hidden_2d, weight, bias)
+
+    actual_chunk = min(chunk_size, B)
+    N_tiles = (V + tile_N - 1) // tile_N
+
+    # GEMM epilogue partials buffer (reused per chunk)
+    partials_buf = torch.empty(
+        N_tiles, actual_chunk, 4,
+        device=hidden_2d.device, dtype=torch.float32,
+    )
+    # Logits buffer for backward recomputation
+    logits_buf = torch.empty(
+        actual_chunk, V, device=hidden_2d.device, dtype=mm_dtype,
+    )
+    logits_fp32_buf = (
+        logits_buf
+        if mm_dtype == torch.float32
+        else torch.empty(actual_chunk, V, device=hidden_2d.device, dtype=torch.float32)
+    )
+
+    weight_3d = weight.unsqueeze(0)
+
+    for start in range(0, B, chunk_size):
+        end = min(start + chunk_size, B)
+        chunk_len = end - start
+        h_chunk = hidden_2d[start:end]
+        t_chunk = target_1d[start:end]
+
+        assert chunk_len % 8 == 0 or chunk_len == B
+
+        # 1. GEMM epilogue forward: logits never hit HBM
+        partials_chunk = partials_buf[:, :chunk_len, :]
+        h_3d = h_chunk.unsqueeze(0)
+        _gemm_ce_entropy_kernel(
+            h_3d, weight_3d, t_chunk, partials_chunk, V,
+            tile_M=tile_M, tile_N=tile_N,
+        )
+
+        # 2. Finalize with LSE output
+        loss_chunk, ent_chunk, lse_chunk = finalize_ce_entropy_with_lse(
+            partials_chunk, N_tiles,
+        )
+        ce_loss[start:end] = loss_chunk
+        entropy[start:end] = ent_chunk
+
+        # 3. Recompute logits via cuBLAS for backward
+        logits_mm = logits_buf[:chunk_len]
+        h_mm = h_chunk if use_native else h_chunk.float()
+        torch.mm(h_mm, weight_t, out=logits_mm)
+        if bias_for_mm is not None:
+            logits_mm.add_(bias_for_mm)
+
+        logits_fp32 = logits_mm
+        if mm_dtype != torch.float32:
+            logits_fp32 = logits_fp32_buf[:chunk_len]
+            logits_fp32.copy_(logits_mm)
+
+        # 4. Compute dlogits from cuBLAS logits
+        #    NOTE: We use cuBLAS logits + their own logsumexp (not WGMMA LSE)
+        #    because WGMMA and cuBLAS produce slightly different logits,
+        #    and mixing LSE from one with logits from the other is inconsistent.
+        g_ce_chunk = torch.full((chunk_len,), ce_weight, device=logits_fp32.device)
+        g_ent_chunk = torch.full((chunk_len,), ent_weight, device=logits_fp32.device)
+        dlogits = _compute_dlogits_chunk(
+            logits_fp32, t_chunk, g_ce_chunk, g_ent_chunk, ent_chunk,
+        )
+
+        # 5. d_hidden = dlogits @ weight
+        dlogits_mm = dlogits.to(mm_dtype)
+        weight_for_mm = weight if use_native else weight.float()
+        d_hidden[start:end] = torch.mm(dlogits_mm, weight_for_mm).to(hidden_2d.dtype)
+
+        # 6. d_weight += dlogits.T @ hidden
+        d_weight.add_(torch.mm(dlogits_mm.t(), h_chunk.to(mm_dtype)).float())
+
+        # 7. d_bias
+        if d_bias is not None:
+            d_bias.add_(dlogits.sum(dim=0))
+
+    d_weight_out = d_weight.to(weight.dtype)
+    d_bias_out = d_bias.to(bias.dtype) if d_bias is not None else None
+
+    return (
+        ce_loss.view(batch_shape),
+        entropy.view(batch_shape),
+        d_hidden.view_as(hidden_states),
+        d_weight_out,
+        d_bias_out,
+    )
+
+
+class GemmFusedCEEntropyFast(torch.autograd.Function):
+    """Fast Level 5 GEMM with interleaved forward/backward.
+
+    Forward: GEMM epilogue for loss/ent, recompute logits for backward,
+    pre-compute d_hidden/d_weight. Backward just scales by dloss.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden_states, weight, target, bias, chunk_size,
+                ce_weight, ent_weight):
+        ce_loss, entropy, d_hidden, d_weight, d_bias = _gemm_fused_fwd_bwd(
+            hidden_states, weight, target, bias=bias, chunk_size=chunk_size,
+            ce_weight=ce_weight, ent_weight=ent_weight,
+        )
+        loss = (ce_weight * ce_loss.sum() + ent_weight * entropy.sum())
+
+        ctx.save_for_backward(d_hidden, d_weight)
+        ctx.d_bias = d_bias
+        ctx.has_bias = bias is not None
+        ctx.mark_non_differentiable(ce_loss, entropy)
+        return loss, ce_loss, entropy
+
+    @staticmethod
+    def backward(ctx, dloss, _g_ce, _g_ent):
+        d_hidden, d_weight = ctx.saved_tensors
+        d_hidden = d_hidden * dloss
+        d_weight = d_weight * dloss
+        d_bias = None
+        if ctx.has_bias:
+            d_bias = ctx.d_bias * dloss
+        return d_hidden, d_weight, None, d_bias, None, None, None
+
+
+def gemm_fused_ce_entropy_fast(
+    hidden_states: Tensor,
+    weight: Tensor,
+    target: Tensor,
+    bias: Optional[Tensor] = None,
+    chunk_size: int = 4096,
+    ce_weight: float = 1.0,
+    ent_weight: float = -1.0,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Fast Level 5 GEMM with pre-computed gradients.
+
+    Returns (loss, ce_loss, entropy):
+      - loss: scalar, requires grad
+      - ce_loss: per-element CE, detached
+      - entropy: per-element entropy, detached
+    """
+    return GemmFusedCEEntropyFast.apply(
+        hidden_states, weight, target, bias, chunk_size, ce_weight, ent_weight,
+    )

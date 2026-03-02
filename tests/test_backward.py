@@ -324,3 +324,178 @@ class TestLevel5Backward:
 
         assert d_h_mae < 0.1, f"d_hidden cross-level MAE={d_h_mae:.6f}"
         assert d_w_mae < 0.1, f"d_weight cross-level MAE={d_w_mae:.6f}"
+
+
+# ===========================================================================
+#  Fast backward tests (CUDA required)
+# ===========================================================================
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestFastBackward:
+    def test_level4_fast_matches_reference(self):
+        """Level 4 fast backward matches fp32 reference."""
+        from fast_reduction.kernel import fused_linear_xent_entropy_fast
+
+        torch.manual_seed(42)
+        B, H, V = 256, 128, 1024
+        hidden = torch.randn(B, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(V, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        target = torch.randint(0, V, (B,), device="cuda")
+
+        loss, ce, ent = fused_linear_xent_entropy_fast(
+            hidden, weight, target, chunk_size=B,
+        )
+        loss.backward()
+
+        assert hidden.grad is not None
+        assert weight.grad is not None
+
+        _, _, d_hidden_ref, d_weight_ref, _ = _fp32_reference_grads(
+            hidden.detach().cpu(), weight.detach().cpu(), target.cpu(),
+        )
+
+        d_hidden_mae = (hidden.grad.float().cpu() - d_hidden_ref.float()).abs().mean()
+        d_weight_mae = (weight.grad.float().cpu() - d_weight_ref.float()).abs().mean()
+
+        assert d_hidden_mae < 0.05, f"d_hidden MAE={d_hidden_mae:.6f}"
+        assert d_weight_mae < 0.05, f"d_weight MAE={d_weight_mae:.6f}"
+
+    def test_level4_fast_matches_slow(self):
+        """Level 4 fast and slow backward produce identical gradients."""
+        from fast_reduction.kernel import (
+            fused_linear_xent_entropy_differentiable,
+            fused_linear_xent_entropy_fast,
+        )
+
+        torch.manual_seed(99)
+        B, H, V = 256, 128, 1024
+        hidden = torch.randn(B, H, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(V, H, device="cuda", dtype=torch.bfloat16)
+        target = torch.randint(0, V, (B,), device="cuda")
+
+        # Slow path
+        h_slow = hidden.clone().requires_grad_(True)
+        w_slow = weight.clone().requires_grad_(True)
+        ce, ent, _ = fused_linear_xent_entropy_differentiable(
+            h_slow, w_slow, target, chunk_size=B,
+        )
+        (ce.sum() - ent.sum()).backward()
+
+        # Fast path
+        h_fast = hidden.clone().requires_grad_(True)
+        w_fast = weight.clone().requires_grad_(True)
+        loss, _, _ = fused_linear_xent_entropy_fast(
+            h_fast, w_fast, target, chunk_size=B,
+        )
+        loss.backward()
+
+        # Should be very close (same code path for dlogits, same matmul)
+        dh_diff = (h_slow.grad.float() - h_fast.grad.float()).abs().max()
+        dw_diff = (w_slow.grad.float() - w_fast.grad.float()).abs().max()
+
+        assert dh_diff < 0.01, f"d_hidden max diff={dh_diff:.6f}"
+        assert dw_diff < 0.01, f"d_weight max diff={dw_diff:.6f}"
+
+    def test_level5_fast_matches_reference(self):
+        """Level 5 fast backward matches fp32 reference."""
+        from fast_reduction.gemm_kernel import gemm_fused_ce_entropy_fast
+
+        torch.manual_seed(123)
+        B, H, V = 256, 128, 1024
+        hidden = torch.randn(B, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(V, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        target = torch.randint(0, V, (B,), device="cuda")
+
+        loss, ce, ent = gemm_fused_ce_entropy_fast(
+            hidden, weight, target, chunk_size=B,
+        )
+        loss.backward()
+
+        _, _, d_hidden_ref, d_weight_ref, _ = _fp32_reference_grads(
+            hidden.detach().cpu(), weight.detach().cpu(), target.cpu(),
+        )
+
+        d_hidden_mae = (hidden.grad.float().cpu() - d_hidden_ref.float()).abs().mean()
+        d_weight_mae = (weight.grad.float().cpu() - d_weight_ref.float()).abs().mean()
+
+        assert d_hidden_mae < 0.05, f"d_hidden MAE={d_hidden_mae:.6f}"
+        assert d_weight_mae < 0.05, f"d_weight MAE={d_weight_mae:.6f}"
+
+    def test_fast_non_aligned_vocab(self):
+        """Fast backward works with non-power-of-2 vocab sizes."""
+        from fast_reduction.kernel import fused_linear_xent_entropy_fast
+
+        torch.manual_seed(777)
+        B, H, V = 256, 64, 1000
+        hidden = torch.randn(B, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(V, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        target = torch.randint(0, V, (B,), device="cuda")
+
+        loss, ce, ent = fused_linear_xent_entropy_fast(
+            hidden, weight, target, chunk_size=B,
+        )
+        loss.backward()
+
+        assert not torch.isnan(hidden.grad).any(), "d_hidden contains NaN"
+        assert not torch.isnan(weight.grad).any(), "d_weight contains NaN"
+
+        _, _, d_hidden_ref, d_weight_ref, _ = _fp32_reference_grads(
+            hidden.detach().cpu(), weight.detach().cpu(), target.cpu(),
+        )
+        d_hidden_mae = (hidden.grad.float().cpu() - d_hidden_ref.float()).abs().mean()
+        assert d_hidden_mae < 0.05, f"d_hidden MAE={d_hidden_mae:.6f}"
+
+    def test_fast_detached_outputs(self):
+        """Fast backward returns detached ce and ent (no grad)."""
+        from fast_reduction.kernel import fused_linear_xent_entropy_fast
+
+        torch.manual_seed(42)
+        B, H, V = 128, 64, 512
+        hidden = torch.randn(B, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(V, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        target = torch.randint(0, V, (B,), device="cuda")
+
+        loss, ce, ent = fused_linear_xent_entropy_fast(
+            hidden, weight, target, chunk_size=B,
+        )
+
+        # loss should require grad, ce and ent should not
+        assert loss.requires_grad
+        assert not ce.requires_grad
+        assert not ent.requires_grad
+
+        # loss should be scalar
+        assert loss.dim() == 0
+
+        # ce and ent should be per-element
+        assert ce.shape == (B,)
+        assert ent.shape == (B,)
+
+    def test_fast_chunked(self):
+        """Fast backward works with chunk_size < B."""
+        from fast_reduction.kernel import fused_linear_xent_entropy_fast
+
+        torch.manual_seed(42)
+        B, H, V = 256, 128, 1024
+        hidden = torch.randn(B, H, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(V, H, device="cuda", dtype=torch.bfloat16)
+        target = torch.randint(0, V, (B,), device="cuda")
+
+        # Unchunked
+        h1 = hidden.clone().requires_grad_(True)
+        w1 = weight.clone().requires_grad_(True)
+        loss1, _, _ = fused_linear_xent_entropy_fast(h1, w1, target, chunk_size=B)
+        loss1.backward()
+
+        # Chunked
+        h2 = hidden.clone().requires_grad_(True)
+        w2 = weight.clone().requires_grad_(True)
+        loss2, _, _ = fused_linear_xent_entropy_fast(h2, w2, target, chunk_size=64)
+        loss2.backward()
+
+        # d_hidden should be identical (no accumulation across chunks)
+        torch.testing.assert_close(h1.grad, h2.grad, atol=0, rtol=0)
+        # d_weight may differ slightly due to bf16 chunked accumulation
+        torch.testing.assert_close(
+            w1.grad.float(), w2.grad.float(), atol=0.05, rtol=0.05,
+        )

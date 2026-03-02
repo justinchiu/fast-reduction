@@ -11,6 +11,7 @@ from fast_reduction.kernel import (
     fused_linear_xent_entropy,
     fused_linear_xent_entropy_backward,
     fused_linear_xent_entropy_differentiable,
+    fused_linear_xent_entropy_fast,
 )
 
 __all__ = [
@@ -24,9 +25,11 @@ __all__ = [
     "fused_linear_xent_entropy",
     "fused_linear_xent_entropy_backward",
     "fused_linear_xent_entropy_differentiable",
+    "fused_linear_xent_entropy_fast",
     "gemm_fused_ce_entropy",
     "gemm_fused_ce_entropy_v2",
     "gemm_fused_ce_entropy_differentiable",
+    "gemm_fused_ce_entropy_fast",
 ]
 
 
@@ -40,4 +43,7 @@ def __getattr__(name):
     if name == "gemm_fused_ce_entropy_differentiable":
         from fast_reduction.gemm_kernel import gemm_fused_ce_entropy_differentiable
         return gemm_fused_ce_entropy_differentiable
+    if name == "gemm_fused_ce_entropy_fast":
+        from fast_reduction.gemm_kernel import gemm_fused_ce_entropy_fast
+        return gemm_fused_ce_entropy_fast
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -446,6 +446,7 @@ class CrossEntropyEntropy(_KernelBase):
         mTarget: cute.Tensor,  # (M,)
         mLoss: cute.Tensor,    # (M,)
         mEntropy: cute.Tensor, # (M,)
+        mLSE: Optional[cute.Tensor],  # (M,) optional LSE output
         stream: cuda.CUstream,
     ):
         assert mX.element_type == self.dtype
@@ -454,7 +455,7 @@ class CrossEntropyEntropy(_KernelBase):
         tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=vecsize)
         num_threads = tiled_copy.size
         self.kernel(
-            mX, mTarget, mLoss, mEntropy,
+            mX, mTarget, mLoss, mEntropy, mLSE,
             tiler_mn, tiled_copy, threads_per_row,
         ).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
@@ -470,6 +471,7 @@ class CrossEntropyEntropy(_KernelBase):
         mTarget: cute.Tensor,
         mLoss: cute.Tensor,
         mEntropy: cute.Tensor,
+        mLSE: Optional[cute.Tensor],
         tiler_mn: cute.Shape,
         tiled_copy: cute.TiledCopy,
         threads_per_row: cutlass.Constexpr[int],
@@ -572,6 +574,8 @@ class CrossEntropyEntropy(_KernelBase):
             mLoss[row] = mLoss.element_type(ce_loss)
             ent = lse - sum_x_exp / sum_exp
             mEntropy[row] = mEntropy.element_type(ent)
+            if const_expr(mLSE is not None):
+                mLSE[row] = lse
 
 
 # ---- torch wrappers ----
@@ -658,12 +662,32 @@ def ce_entropy_fwd_out(
     entropy: Tensor,
 ) -> None:
     """Cross-entropy + entropy forward, writing into pre-allocated outputs."""
+    _ce_entropy_fwd_impl(x, target, loss, entropy, lse=None)
+
+
+@torch.library.custom_op(
+    "fast_reduction::ce_entropy_fwd_lse", mutates_args={"loss", "entropy", "lse"}
+)
+def ce_entropy_fwd_lse_out(
+    x: Tensor,
+    target: Tensor,
+    loss: Tensor,
+    entropy: Tensor,
+    lse: Tensor,
+) -> None:
+    """Cross-entropy + entropy + LSE forward, writing into pre-allocated outputs."""
+    _ce_entropy_fwd_impl(x, target, loss, entropy, lse=lse)
+
+
+def _ce_entropy_fwd_impl(x, target, loss, entropy, lse=None):
+    """Shared implementation for ce_entropy_fwd with/without LSE output."""
     assert x.dim() == 2 and target.dim() == 1
     assert x.is_cuda and target.is_cuda
     N = x.size(1)
     dtype = _torch2cute[x.dtype]
     target_dtype = {torch.int32: cutlass.Int32, torch.int64: cutlass.Int64}[target.dtype]
-    key = (dtype, target_dtype, N)
+    has_lse = lse is not None
+    key = (dtype, target_dtype, N, has_lse)
     if key not in _compile_cache_joint:
         batch_sym = cute.sym_int()
         div = math.gcd(128 // dtype.width, N)
@@ -671,13 +695,17 @@ def ce_entropy_fwd_out(
         target_cute = _make_fake_tensor(target_dtype, (batch_sym,))
         loss_cute = _make_fake_tensor(Float32, (batch_sym,))
         entropy_cute = _make_fake_tensor(Float32, (batch_sym,))
+        lse_cute = _make_fake_tensor(Float32, (batch_sym,)) if has_lse else None
         op = CrossEntropyEntropy(dtype, N)
         _compile_cache_joint[key] = cute.compile(
-            op, x_cute, target_cute, loss_cute, entropy_cute,
+            op, x_cute, target_cute, loss_cute, entropy_cute, lse_cute,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
-    _compile_cache_joint[key](x, target, loss, entropy)
+    if has_lse:
+        _compile_cache_joint[key](x, target, loss, entropy, lse)
+    else:
+        _compile_cache_joint[key](x, target, loss, entropy, None)
 
 
 def ce_entropy_fwd(x: Tensor, target: Tensor) -> Tuple[Tensor, Tensor]:
@@ -690,3 +718,18 @@ def ce_entropy_fwd(x: Tensor, target: Tensor) -> Tuple[Tensor, Tensor]:
     entropy = torch.empty(M, device=x.device, dtype=torch.float32)
     ce_entropy_fwd_out(x, target, loss, entropy)
     return loss, entropy
+
+
+def ce_entropy_fwd_with_lse(
+    x: Tensor, target: Tensor,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Cross-entropy loss, entropy, and LSE from logits in one pass.
+
+    Returns (loss [M], entropy [M], lse [M]) all fp32.
+    """
+    M = x.size(0)
+    loss = torch.empty(M, device=x.device, dtype=torch.float32)
+    entropy = torch.empty(M, device=x.device, dtype=torch.float32)
+    lse = torch.empty(M, device=x.device, dtype=torch.float32)
+    ce_entropy_fwd_lse_out(x, target, loss, entropy, lse)
+    return loss, entropy, lse
