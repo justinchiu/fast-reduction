@@ -88,6 +88,68 @@ def baseline_linear_xent_entropy(
     )
 
 
+def baseline_linear_xent_entropy_backward(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    g_ce: Optional[torch.Tensor] = None,
+    g_ent: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Reference backward for linear + CE + entropy using PyTorch autograd.
+
+    Computes gradients for loss = sum(g_ce * ce) + sum(g_ent * entropy).
+    Default g_ce=1, g_ent=-1 matches the benchmark loss ce.sum() - ent.sum().
+
+    Returns (ce_loss, entropy, d_hidden, d_weight, d_bias).
+    All computation in fp32 for ground truth.
+    """
+    hidden_2d = hidden_states.detach().float().reshape(-1, hidden_states.shape[-1])
+    weight_fp32 = weight.detach().float()
+    target_1d = target.reshape(-1)
+    B = hidden_2d.shape[0]
+
+    hidden_2d.requires_grad_(True)
+    weight_fp32.requires_grad_(True)
+
+    bias_fp32 = None
+    if bias is not None:
+        bias_fp32 = bias.detach().float()
+        bias_fp32.requires_grad_(True)
+
+    logits = F.linear(hidden_2d, weight_fp32, bias_fp32)
+    log_softmax = F.log_softmax(logits, dim=-1)
+    softmax = log_softmax.exp()
+
+    ce_loss = F.nll_loss(log_softmax, target_1d, reduction="none")
+    entropy = -(softmax * log_softmax).sum(dim=-1)
+
+    if g_ce is None:
+        g_ce = torch.ones_like(ce_loss)
+    else:
+        g_ce = g_ce.reshape(-1).float()
+    if g_ent is None:
+        g_ent = -torch.ones_like(entropy)
+    else:
+        g_ent = g_ent.reshape(-1).float()
+
+    loss = (g_ce * ce_loss + g_ent * entropy).sum()
+    loss.backward()
+
+    batch_shape = hidden_states.shape[:-1]
+    d_hidden = hidden_2d.grad.to(hidden_states.dtype).view_as(hidden_states)
+    d_weight = weight_fp32.grad.to(weight.dtype)
+    d_bias = bias_fp32.grad.to(bias.dtype) if bias_fp32 is not None else None
+
+    return (
+        ce_loss.detach().view(batch_shape),
+        entropy.detach().view(batch_shape),
+        d_hidden,
+        d_weight,
+        d_bias,
+    )
+
+
 # ===========================================================================
 #  Chunked baselines (memory-efficient — no full [B, V] materialisation)
 # ===========================================================================

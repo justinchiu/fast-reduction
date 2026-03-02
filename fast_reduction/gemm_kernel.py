@@ -9,6 +9,10 @@ For each chunk of the batch dimension:
 
 The logits never hit HBM — they are reduced inside the GEMM epilogue
 directly from the accumulator registers via scratch SMEM.
+
+Backward pass: recomputes logits via cuBLAS matmul, computes dlogits
+element-wise, then matmul for d_hidden/d_weight. The backward does
+NOT use the GEMM epilogue — it's matmul-bound, not memory-bound.
 """
 
 from typing import Optional, Tuple
@@ -32,6 +36,11 @@ from quack.gemm_wrapper_utils import GemmWrapperBase, GemmTensorInfo
 from fast_reduction.gemm_ce_entropy_epilogue import GemmCEEntropySm90
 from fast_reduction.gemm_ce_entropy_epilogue_v2 import GemmCEEntropyV2Sm90
 from fast_reduction.gemm_ce_entropy_finalize import finalize_ce_entropy
+from fast_reduction.kernel import (
+    _mm_setup,
+    _compute_dlogits_chunk,
+    fused_linear_xent_entropy_backward,
+)
 
 
 # ---- compile caches ----
@@ -408,3 +417,51 @@ def gemm_fused_ce_entropy_v2(
         entropy.view(batch_shape),
         log_probs.view(batch_shape),
     )
+
+
+# ========================================================================
+# Level 5 backward (shared by v5.1 and v5.2)
+# ========================================================================
+
+class GemmFusedCEEntropy(torch.autograd.Function):
+    """Differentiable Level 5 GEMM with fused CE+entropy epilogue.
+
+    Forward uses GEMM epilogue (logits never hit HBM).
+    Backward recomputes logits via cuBLAS and uses PyTorch ops for dlogits.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden_states, weight, target, bias, chunk_size):
+        ce_loss, entropy, log_probs = gemm_fused_ce_entropy(
+            hidden_states, weight, target, bias=bias, chunk_size=chunk_size,
+        )
+        ctx.save_for_backward(hidden_states, weight, target, entropy)
+        ctx.bias = bias
+        ctx.chunk_size = chunk_size
+        return ce_loss, entropy, log_probs
+
+    @staticmethod
+    def backward(ctx, g_ce, g_ent, g_lp):
+        hidden_states, weight, target, entropy = ctx.saved_tensors
+        if g_lp is not None:
+            g_ce = g_ce - g_lp
+        # Reuse the same chunked backward as levels 3-4
+        d_hidden, d_weight, d_bias = fused_linear_xent_entropy_backward(
+            hidden_states, weight, target, g_ce, g_ent, entropy,
+            bias=ctx.bias, chunk_size=ctx.chunk_size,
+        )
+        return d_hidden, d_weight, None, d_bias, None
+
+
+def gemm_fused_ce_entropy_differentiable(
+    hidden_states: Tensor,
+    weight: Tensor,
+    target: Tensor,
+    bias: Optional[Tensor] = None,
+    chunk_size: int = 4096,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Differentiable version of gemm_fused_ce_entropy (Level 5).
+
+    Same interface, but supports .backward() on the returned tensors.
+    """
+    return GemmFusedCEEntropy.apply(hidden_states, weight, target, bias, chunk_size)

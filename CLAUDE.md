@@ -33,6 +33,19 @@ The reduction kernels are near speed of light. The bottleneck in levels 1-4 is t
 `torch.mm` matmul (~34 TFLOP per call at these sizes). Level 5 eliminates the logits
 HBM round-trip entirely by computing reductions in the GEMM epilogue.
 
+**Forward + backward** (B=32768, H=4096, V=128256, bf16, chunk=4096):
+
+| Level | Variant | Fwd+Bwd | Peak mem | Notes |
+|-------|---------|---------|----------|-------|
+| 1 | torch unfused | OOM | — | Full [B,V] logits |
+| 2 | torch chunked | 309 ms | 38.5 GB | Autograd saves logits per chunk |
+| 4 | CuTe joint | 351 ms | 13.3 GB | Recomputes logits in backward |
+| 5 | GEMM epilogue | 345 ms | 13.3 GB | Fwd: GEMM epilogue, Bwd: recompute |
+
+The backward recomputes logits via cuBLAS (1 extra matmul per chunk),
+trading ~80ms of compute for **25 GB less peak memory** (13.3 vs 38.5 GB).
+At B=4096 (single chunk), Level 5 fwd+bwd = 49ms vs torch chunked = 38ms.
+
 ## Architecture: what's fused and what's not
 
 Levels 1-4 all do **chunked matmul** (`torch.mm` via cuBLAS) followed by a
@@ -50,21 +63,23 @@ has not implemented a cross-entropy or entropy epilogue.
 ```
 fast_reduction/
   __init__.py
-  baseline.py              pure-PyTorch reference (unfused + chunked variants)
-  kernel.py                chunked matmul + CuTe reduction (levels 3 & 4)
+  baseline.py              pure-PyTorch reference (unfused + chunked + backward)
+  kernel.py                chunked matmul + CuTe reduction (levels 3 & 4) + backward + autograd
   cute_cross_entropy.py    CuTe DSL kernels: CE-only, entropy-only, joint CE+entropy
   reduce.py                reduction primitives (thread → warp → block → cluster)
   cute_utils.py             low-level PTX: DSMEM, f32↔i64 packing, pointer arithmetic
   gemm_ce_entropy_epilogue.py   Level 5 GEMM epilogue mixin
   gemm_ce_entropy_finalize.py   Level 5 finalization kernel
-  gemm_kernel.py                Level 5 driver
+  gemm_kernel.py                Level 5 driver + backward + autograd
 
 benchmarks/
-  bench_linear_xent_entropy.py   wall-clock, peak mem, model BW, accuracy (all 6 levels)
+  bench_linear_xent_entropy.py   forward-only: wall-clock, peak mem, model BW, accuracy
+  bench_fwd_bwd.py               forward + backward: time, peak mem, gradient accuracy
   profile.sh                     Nsight Compute profiling script
 
 tests/
-  test_ce_impls.py         correctness tests vs PyTorch reference
+  test_ce_impls.py         forward correctness tests vs PyTorch reference
+  test_backward.py         backward gradient correctness tests vs fp32 reference
   test_entropy_large_v.py  large-V entropy accuracy tests (cluster reduction)
 
 docs/
@@ -81,9 +96,14 @@ uv run pytest tests/test_ce_impls.py -v
 ## Benchmarking
 
 ```bash
+# Forward-only benchmark
 uv run python benchmarks/bench_linear_xent_entropy.py
 uv run python benchmarks/bench_linear_xent_entropy.py --B 32768 --V 128256 --H 4096
 uv run python benchmarks/bench_linear_xent_entropy.py --no-accuracy   # speed/memory only
+
+# Forward + backward benchmark
+uv run python benchmarks/bench_fwd_bwd.py
+uv run python benchmarks/bench_fwd_bwd.py --B 4096 --V 128256 --H 4096
 ```
 
 ## API
@@ -91,7 +111,7 @@ uv run python benchmarks/bench_linear_xent_entropy.py --no-accuracy   # speed/me
 ```python
 from fast_reduction.kernel import fused_linear_xent_entropy, separate_linear_xent_entropy
 
-# Level 4: joint CE+entropy (one CuTe kernel per chunk)
+# Level 4: joint CE+entropy (one CuTe kernel per chunk) — forward only
 ce_loss, entropy, log_probs = fused_linear_xent_entropy(
     hidden_states,  # [B, H]  bf16 or fp32
     weight,         # [V, H]
@@ -100,13 +120,39 @@ ce_loss, entropy, log_probs = fused_linear_xent_entropy(
     chunk_size=4096,
 )
 
-# Level 3: separate CE + entropy (two CuTe kernels per chunk)
+# Level 3: separate CE + entropy (two CuTe kernels per chunk) — forward only
 ce_loss, entropy, log_probs = separate_linear_xent_entropy(
     hidden_states, weight, target, chunk_size=4096,
 )
 ```
 
+### Differentiable API (supports .backward())
+
+```python
+from fast_reduction.kernel import fused_linear_xent_entropy_differentiable
+from fast_reduction.gemm_kernel import gemm_fused_ce_entropy_differentiable
+
+# Level 4: differentiable (autograd.Function)
+hidden.requires_grad_(True)
+weight.requires_grad_(True)
+ce_loss, entropy, log_probs = fused_linear_xent_entropy_differentiable(
+    hidden, weight, target, bias=None, chunk_size=4096,
+)
+loss = ce_loss.sum() - entropy.sum()
+loss.backward()  # hidden.grad, weight.grad populated
+
+# Level 5: differentiable (autograd.Function)
+ce_loss, entropy, log_probs = gemm_fused_ce_entropy_differentiable(
+    hidden, weight, target, bias=None, chunk_size=4096,
+)
+```
+
+The backward recomputes logits per chunk (no logits stored in memory),
+computes dlogits element-wise in fp32, then uses bf16 matmul for
+d_hidden and d_weight accumulation.
+
 Ground truth: `fast_reduction.baseline_linear_xent_entropy` (same signature minus chunk_size).
+Ground truth backward: `fast_reduction.baseline_linear_xent_entropy_backward`.
 
 ## Dependencies
 
