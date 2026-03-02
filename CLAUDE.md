@@ -9,17 +9,9 @@ Implement a **fused linear + cross-entropy + entropy** kernel for H100 (Hopper, 
 
 8 x H100 80 GB (Hopper, sm90, HBM3).
 
-## Performance ladder
+## Performance
 
-Five levels of fusion, measured at B=32768, H=4096, V=128256, bf16, chunk=4096:
-
-| Level | Variant | Time | Peak mem | Approach |
-|-------|---------|------|----------|----------|
-| 1 | torch unfused | 711 ms | 65 GB | Full [B,V] logits, separate F.cross_entropy + entropy |
-| 2 | torch chunked | 723 ms | 11 GB | Chunked [chunk,V], same PyTorch ops |
-| 3 | CuTe separate | 680 ms | 5.4 GB | Chunked matmul + 2 CuTe kernels (CE, entropy) |
-| 4 | CuTe joint | 675 ms | 5.4 GB | Chunked matmul + 1 CuTe kernel (CE+entropy) |
-| 5 | GEMM epilogue | 68 ms | 1.3 GB | Reduction fused into GEMM epilogue (logits never hit HBM) |
+See README.md for up-to-date forward and forward+backward results tables.
 
 **CuTe reduction kernels alone** (no matmul, B=4096, V=128256, fp32):
 
@@ -33,19 +25,6 @@ The reduction kernels are near speed of light. The bottleneck in levels 1-4 is t
 `torch.mm` matmul (~34 TFLOP per call at these sizes). Level 5 eliminates the logits
 HBM round-trip entirely by computing reductions in the GEMM epilogue.
 
-**Forward + backward** (B=32768, H=4096, V=128256, bf16, chunk=4096):
-
-| Level | Variant | Fwd+Bwd | Peak mem | Notes |
-|-------|---------|---------|----------|-------|
-| 1 | torch unfused | OOM | — | Full [B,V] logits |
-| 2 | torch chunked | 309 ms | 38.5 GB | Autograd saves logits per chunk |
-| 4 | CuTe joint | 351 ms | 13.3 GB | Recomputes logits in backward |
-| 5 | GEMM epilogue | 345 ms | 13.3 GB | Fwd: GEMM epilogue, Bwd: recompute |
-
-The backward recomputes logits via cuBLAS (1 extra matmul per chunk),
-trading ~80ms of compute for **25 GB less peak memory** (13.3 vs 38.5 GB).
-At B=4096 (single chunk), Level 5 fwd+bwd = 49ms vs torch chunked = 38ms.
-
 ## Architecture: what's fused and what's not
 
 Levels 1-4 all do **chunked matmul** (`torch.mm` via cuBLAS) followed by a
@@ -53,10 +32,14 @@ separate **CuTe DSL reduction kernel**. The logits `[chunk, V]` buffer is
 reused each iteration, so peak memory is O(chunk_size * V) instead of O(B * V).
 But the logits still go through HBM between the matmul and the reduction.
 
-Level 5 would fuse the reduction into the GEMM epilogue so logits stay in
-registers/SMEM and never touch HBM. Quack has the infrastructure for this
-(`gemm_sm90.py` extensible epilogue with `epi_visit_subtile()` hooks) but
-has not implemented a cross-entropy or entropy epilogue.
+Level 5 fuses the reduction into the GEMM epilogue so logits stay in
+registers/SMEM and never touch HBM, using quack's extensible epilogue
+infrastructure (`gemm_sm90.py` with `epi_visit_subtile()` hooks).
+
+Level 5M (megakernel) extends this for training: the epilogue writes both
+partial reduction stats AND fp32 logits to GMEM, then a fused CuTe dlogits
+kernel computes dlogits in one pass. This eliminates the cuBLAS logits
+recompute and gives fp32-precision gradients from the WGMMA accumulator.
 
 ## Key files
 
@@ -66,11 +49,14 @@ fast_reduction/
   baseline.py              pure-PyTorch reference (unfused + chunked + backward)
   kernel.py                chunked matmul + CuTe reduction (levels 3 & 4) + backward + autograd
   cute_cross_entropy.py    CuTe DSL kernels: CE-only, entropy-only, joint CE+entropy
+  cute_dlogits.py          fused CuTe dlogits kernel (level 5M backward)
   reduce.py                reduction primitives (thread → warp → block → cluster)
   cute_utils.py             low-level PTX: DSMEM, f32↔i64 packing, pointer arithmetic
-  gemm_ce_entropy_epilogue.py   Level 5 GEMM epilogue mixin
-  gemm_ce_entropy_finalize.py   Level 5 finalization kernel
-  gemm_kernel.py                Level 5 driver + backward + autograd
+  gemm_ce_entropy_epilogue.py       Level 5 GEMM epilogue mixin (single-pass)
+  gemm_ce_entropy_epilogue_v2.py    Level 5.2 GEMM epilogue mixin (two-pass)
+  gemm_ce_entropy_bwd_epilogue.py   Level 5M GEMM epilogue (partials + logits output)
+  gemm_ce_entropy_finalize.py       Level 5 finalization kernel
+  gemm_kernel.py                    Level 5 driver + megakernel + backward + autograd
 
 benchmarks/
   bench_linear_xent_entropy.py   forward-only: wall-clock, peak mem, model BW, accuracy
@@ -126,30 +112,30 @@ ce_loss, entropy, log_probs = separate_linear_xent_entropy(
 )
 ```
 
-### Differentiable API (supports .backward())
+### Training API (fast forward + backward)
 
 ```python
-from fast_reduction.kernel import fused_linear_xent_entropy_differentiable
-from fast_reduction.gemm_kernel import gemm_fused_ce_entropy_differentiable
+from fast_reduction.gemm_kernel import gemm_megakernel_fast
 
-# Level 4: differentiable (autograd.Function)
+# Level 5M: GEMM epilogue + fused CuTe dlogits (recommended for training)
 hidden.requires_grad_(True)
 weight.requires_grad_(True)
-ce_loss, entropy, log_probs = fused_linear_xent_entropy_differentiable(
-    hidden, weight, target, bias=None, chunk_size=4096,
+loss, ce_loss, entropy = gemm_megakernel_fast(
+    hidden, weight, target, chunk_size=4096,
+    ce_weight=1.0, ent_weight=-1.0,
 )
-loss = ce_loss.sum() - entropy.sum()
 loss.backward()  # hidden.grad, weight.grad populated
+# ce_loss, entropy are detached (for logging)
 
-# Level 5: differentiable (autograd.Function)
-ce_loss, entropy, log_probs = gemm_fused_ce_entropy_differentiable(
-    hidden, weight, target, bias=None, chunk_size=4096,
+# Level 4F: CuTe joint fast (cuBLAS matmul + CuTe reduction)
+from fast_reduction.kernel import fused_linear_xent_entropy_fast
+loss, ce_loss, entropy = fused_linear_xent_entropy_fast(
+    hidden, weight, target, chunk_size=4096,
 )
 ```
 
-The backward recomputes logits per chunk (no logits stored in memory),
-computes dlogits element-wise in fp32, then uses bf16 matmul for
-d_hidden and d_weight accumulation.
+The fast variants pre-compute gradients during the forward pass
+(liger/quack pattern), so backward just scales by the upstream scalar.
 
 Ground truth: `fast_reduction.baseline_linear_xent_entropy` (same signature minus chunk_size).
 Ground truth backward: `fast_reduction.baseline_linear_xent_entropy_backward`.
@@ -192,6 +178,74 @@ CUDA_VISIBLE_DEVICES=3 uv run pytest tests/test_ce_impls.py -v
 
 Always check `nvidia-smi` first, pick a GPU with 0% utilization and 0 MB used,
 then prefix your command with `CUDA_VISIBLE_DEVICES=<gpu_id>`.
+
+## Commit Contract
+
+Every commit must include these sections in the commit message.
+
+### 1) High-Level Plan
+
+State:
+- what problem is being solved,
+- what approach is being taken,
+- what files/components are affected,
+- what risks or tradeoffs are expected.
+
+### 2) Exploration / What Didn't Work
+
+Document the journey, not just the destination:
+- what alternatives were tried and why they failed,
+- dead ends, surprising findings, performance cliffs,
+- how the final approach was arrived at and why it won.
+
+This is the most valuable part of the commit — future readers need to understand
+*why* the code looks the way it does, not just *what* it does.
+
+### 3) Red-Green TDD Evidence
+
+Show the test-driven sequence:
+- **RED**: the new/updated test that fails before the fix (include command and failure signal),
+- **GREEN**: the same test passing after the fix,
+- **REGRESSION CHECK**: relevant suite passing (`tests/test_ce_impls.py`, `tests/test_backward.py`, or full `pytest` as appropriate).
+
+If true RED cannot be demonstrated (e.g. infrastructure-only change), explicitly state why.
+
+### 4) Numerical Results → README.md
+
+For kernel/math/performance changes, report before/after numbers with command used and exact shape/config:
+- `B`, `H`, `V`, `chunk`, dtype, GPU,
+- runtime (ms),
+- peak memory (GB),
+- numerical error metrics (CE MAE, entropy MAE, and gradient MAE when applicable).
+
+If a change is not expected to affect numerics/perf, include "Numerical impact: N/A" and still provide test evidence.
+
+**Update README.md** with the final results whenever performance or accuracy tables change.
+The README is the single source of truth for published numbers.
+
+### Suggested Commit Template
+
+```text
+<scope>: <short summary>
+
+Plan:
+- ...
+
+Exploration:
+- Tried X, but Y because Z
+- Found that A was the bottleneck, not B as expected
+- Final approach: ...
+
+TDD:
+- RED: <command> -> <failing assertion/error>
+- GREEN: <command> -> <pass result>
+- REGRESSION: <command> -> <pass result>
+
+Numerical results:
+- Config: B=..., H=..., V=..., chunk=..., dtype=..., GPU=...
+- Before: time=... ms, peak=... GB, CE_MAE=..., ENT_MAE=..., dH_MAE=...
+- After:  time=... ms, peak=... GB, CE_MAE=..., ENT_MAE=..., dH_MAE=...
+```
 
 ## Reference
 
